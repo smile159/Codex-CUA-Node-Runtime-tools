@@ -46,6 +46,8 @@ STAGING_RE = re.compile(
 COPY_BUFFER_SIZE = 4 * 1024 * 1024
 DISK_SPACE_MARGIN = 64 * 1024 * 1024
 HEALTH_TIMEOUT_SECONDS = 60
+ERROR_INSUFFICIENT_BUFFER = 122
+APPMODEL_ERROR_NO_PACKAGE = 15700
 
 
 class RepairError(RuntimeError):
@@ -94,6 +96,7 @@ class ProcessInfo:
     name: str
     image_path: str | None
     command_line: str | None
+    package_family_name: str | None
 
 
 def configure_console() -> None:
@@ -702,6 +705,40 @@ def query_process_image_path(pid: int) -> str | None:
         api.CloseHandle(handle)
 
 
+def query_process_package_family_name(pid: int) -> str | None:
+    api = kernel32()
+    try:
+        get_package_family_name = api.GetPackageFamilyName
+    except AttributeError:
+        return None
+    api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    api.OpenProcess.restype = wintypes.HANDLE
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    get_package_family_name.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.UINT),
+        wintypes.LPWSTR,
+    ]
+    get_package_family_name.restype = wintypes.LONG
+
+    handle = api.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        length = wintypes.UINT(0)
+        result = get_package_family_name(handle, ctypes.byref(length), None)
+        if result == APPMODEL_ERROR_NO_PACKAGE:
+            return None
+        if result != ERROR_INSUFFICIENT_BUFFER or length.value <= 1:
+            return None
+        buffer = ctypes.create_unicode_buffer(length.value)
+        result = get_package_family_name(handle, ctypes.byref(length), buffer)
+        return buffer.value if result == 0 and buffer.value else None
+    finally:
+        api.CloseHandle(handle)
+
+
 def query_process_command_line(pid: int) -> str | None:
     api = kernel32()
     api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -769,9 +806,11 @@ def enumerate_processes() -> list[ProcessInfo]:
             if name.lower() in relevant_names:
                 path = query_process_image_path(entry.th32ProcessID)
                 command_line = query_process_command_line(entry.th32ProcessID)
+                package_family_name = query_process_package_family_name(entry.th32ProcessID)
             else:
                 path = None
                 command_line = None
+                package_family_name = None
             result.append(
                 ProcessInfo(
                     int(entry.th32ProcessID),
@@ -779,6 +818,7 @@ def enumerate_processes() -> list[ProcessInfo]:
                     name,
                     path,
                     command_line,
+                    package_family_name,
                 )
             )
             success = api.Process32NextW(snapshot, ctypes.byref(entry))
@@ -798,6 +838,20 @@ def is_path_within(path: str | None, root: Path) -> bool:
         return os.path.commonpath([normalized_path(path), normalized_path(root)]) == normalized_path(root)
     except ValueError:
         return False
+
+
+def is_process_from_package(process: ProcessInfo, package: PackageInfo) -> bool:
+    if process.package_family_name:
+        return process.package_family_name.casefold() == package.package_family_name.casefold()
+    return is_path_within(process.image_path, package.install_location)
+
+
+def is_current_app_process(process: ProcessInfo, package: PackageInfo) -> bool:
+    executable_name = Path(package.executable_relative).name
+    return (
+        process.name.casefold() == executable_name.casefold()
+        and is_process_from_package(process, package)
+    )
 
 
 def descendants_of(root_pids: set[int], processes: Iterable[ProcessInfo]) -> set[int]:
@@ -914,15 +968,14 @@ def terminate_process(pid: int) -> bool:
 
 def select_codex_processes(
     processes: list[ProcessInfo],
-    install_location: Path,
+    package: PackageInfo,
     runtime_root: Path,
     codex_bin_root: Path,
 ) -> tuple[set[int], set[int]]:
     chat_pids = {
         process.pid
         for process in processes
-        if process.name.lower() == "chatgpt.exe"
-        and is_path_within(process.image_path, install_location)
+        if is_current_app_process(process, package)
     }
     descendants = descendants_of(chat_pids, processes)
     target_pids = set(chat_pids)
@@ -936,7 +989,7 @@ def select_codex_processes(
         elif (
             lowered_name == "codex.exe"
             and (is_path_within(process.image_path, codex_bin_root)
-                 or is_path_within(process.image_path, install_location / "app" / "resources"))
+                 or is_process_from_package(process, package))
             and (
                 process.pid in descendants
                 or "app-server" in (process.command_line or "").lower()
@@ -947,13 +1000,13 @@ def select_codex_processes(
 
 
 def stop_codex_processes(
-    install_location: Path,
+    package: PackageInfo,
     runtime_root: Path,
     codex_bin_root: Path,
 ) -> None:
     processes = enumerate_processes()
     chat_pids, target_pids = select_codex_processes(
-        processes, install_location, runtime_root, codex_bin_root
+        processes, package, runtime_root, codex_bin_root
     )
     if not target_pids:
         print("[进程] 未发现需要关闭的 Codex 进程。")
@@ -964,7 +1017,7 @@ def stop_codex_processes(
     def current_targets() -> tuple[list[ProcessInfo], set[int]]:
         current_processes = enumerate_processes()
         _chat, selected = select_codex_processes(
-            current_processes, install_location, runtime_root, codex_bin_root
+            current_processes, package, runtime_root, codex_bin_root
         )
         current_pids = {process.pid for process in current_processes}
         known_target_pids.update(selected)
@@ -1255,28 +1308,23 @@ def probe_startup(package: PackageInfo, codex_bin_root: Path) -> StartupState:
     except (OSError, RepairError) as exc:
         return StartupState((), 0, False, False, (f"进程查询失败：{exc}",))
     executable = package.install_location / package.executable_relative
-    app = [
-        p for p in processes
-        if p.image_path and normalized_path(p.image_path) == normalized_path(executable)
-    ]
-    # An unknown command line is acceptable for observation, but never for recovery.
-    main_pids = {
-        p.pid for p in app
-        if not p.command_line or (
-            "--type=" not in p.command_line and "--crashpad-handler" not in p.command_line
-        )
-    }
+    app = [p for p in processes if is_current_app_process(p, package)]
     app_pids = {p.pid for p in app}
     descendants = descendants_of(app_pids, processes)
     renderer = any("--type=renderer" in (p.command_line or "") for p in app)
     server = any(
         p.name.lower() == "codex.exe"
         and (is_path_within(p.image_path, codex_bin_root)
-             or is_path_within(p.image_path, package.install_location / "app" / "resources"))
+             or is_process_from_package(p, package))
         and ("app-server" in (p.command_line or "") or p.pid in descendants)
         for p in processes
     )
-    if any(p.name.lower() == executable.name.lower() and not p.image_path for p in processes):
+    if any(
+        p.name.lower() == executable.name.lower()
+        and not p.image_path
+        and not p.package_family_name
+        for p in processes
+    ):
         errors.append("部分同名进程路径无法查询，无法确认其归属")
     windows: list[WindowState] = []
     try:
@@ -1300,7 +1348,7 @@ def probe_startup(package: PackageInfo, codex_bin_root: Path) -> StartupState:
                 pid = wintypes.DWORD()
                 if not api.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)):
                     return True  # Window may have disappeared during enumeration.
-                if pid.value not in main_pids:
+                if pid.value not in app_pids:
                     return True
                 name = ctypes.create_unicode_buffer(256)
                 if not api.GetClassNameW(hwnd, name, len(name)):
@@ -1365,14 +1413,51 @@ def describe_startup(state: StartupState) -> str:
     )
 
 
+def compact_window_status(state: StartupState) -> str:
+    if state.ready:
+        return "OK"
+    if not state.windows:
+        return "ERROR" if state.errors else "NONE"
+    if any(window.cloaked for window in state.windows):
+        return "CLOAKED"
+    if any(window.minimized for window in state.windows):
+        return "MINIMIZED"
+    if any(not window.visible for window in state.windows):
+        return "HIDDEN"
+    if any(not window.on_screen for window in state.windows):
+        return "OFFSCREEN"
+    return "UNKNOWN"
+
+
 def wait_for_health(package: PackageInfo, codex_bin_root: Path, timeout_seconds: int) -> ValidationResult:
-    deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    next_sample = started
     previous: set[tuple[int, int]] = set()
     width = 0
+    state: StartupState | None = None
     while True:
+        now = time.monotonic()
+        if now < next_sample:
+            time.sleep(next_sample - now)
+        sampled_at = time.monotonic()
+        if sampled_at >= deadline and state is not None:
+            print()
+            return ValidationResult(False, ("启动检测超时：" + describe_startup(state),))
+
         state = probe_startup(package, codex_bin_root)
         current = {(w.hwnd, w.pid) for w in state.windows if w.ready}
-        line = "[检测] " + describe_startup(state)
+        elapsed = min(int(sampled_at - started) + 1, timeout_seconds)
+        digits = len(str(timeout_seconds))
+        renderer_status = "YES" if state.renderer else "NO"
+        app_server_status = "YES" if state.app_server else "NO"
+        line = (
+            f"[检测 {elapsed:0{digits}d}/{timeout_seconds}] "
+            f"进程={state.process_count:02d} "
+            f"窗口={compact_window_status(state):<9} "
+            f"renderer={renderer_status:<3} "
+            f"app-server={app_server_status:<3}"
+        )
         print("\r" + line + " " * max(width - len(line), 0), end="", flush=True)
         width = len(line)
         if previous & current:
@@ -1380,11 +1465,15 @@ def wait_for_health(package: PackageInfo, codex_bin_root: Path, timeout_seconds:
             print("[完成] 应用窗口启动成功；后台状态仅代表进程观察结果。")
             return ValidationResult(True, ())
         previous = current
-        remaining = deadline - time.monotonic()
+        now = time.monotonic()
+        remaining = deadline - now
         if remaining <= 0:
             print()
             return ValidationResult(False, ("启动检测超时：" + describe_startup(state),))
-        time.sleep(min(1.0, remaining))
+        next_sample += 1.0
+        if next_sample <= now:
+            next_sample = now + 1.0
+        next_sample = min(next_sample, deadline)
 
 
 def recover_window(package: PackageInfo, codex_bin_root: Path, selected: WindowState, move: bool) -> None:
@@ -1398,18 +1487,35 @@ def recover_window(package: PackageInfo, codex_bin_root: Path, selected: WindowS
         print("[恢复] 窗口已消失或状态已变化，请重新检测。")
         return
     process = next((p for p in enumerate_processes() if p.pid == target.pid), None)
-    expected = package.install_location / package.executable_relative
-    if (
-        process is None or not process.image_path or not process.command_line
-        or normalized_path(process.image_path) != normalized_path(expected)
-        or "--type=" in process.command_line or "--crashpad-handler" in process.command_line
-    ):
-        print("[恢复] 无法确认主进程身份，未操作窗口。")
+    if process is None or not is_current_app_process(process, package):
+        print("[恢复] 无法确认当前应用进程身份，未操作窗口。")
         return
     api = window_api()
     owner = wintypes.DWORD()
     if not api.GetWindowThreadProcessId(target.hwnd, ctypes.byref(owner)) or owner.value != target.pid:
         print("[恢复] 窗口归属已变化，请重新检测。")
+        return
+    class_name = ctypes.create_unicode_buffer(256)
+    if not api.GetClassNameW(target.hwnd, class_name, len(class_name)):
+        print("[恢复] 无法重新确认窗口类名，未操作窗口。")
+        return
+    style_query = getattr(api, "GetWindowLongPtrW", None) or api.GetWindowLongW
+    style_query.argtypes = [wintypes.HWND, ctypes.c_int]
+    style_query.restype = ctypes.c_ssize_t
+    ctypes.set_last_error(0)
+    style = style_query(target.hwnd, -20)  # GWL_EXSTYLE
+    style_error = ctypes.get_last_error()
+    rect = wintypes.RECT()
+    if (
+        not class_name.value.startswith("Chrome_WidgetWin_")
+        or (not style and style_error)
+        or style & 0x80
+        or api.GetWindow(target.hwnd, 4)  # WS_EX_TOOLWINDOW / GW_OWNER
+        or not api.GetWindowRect(target.hwnd, ctypes.byref(rect))
+        or rect.right <= rect.left
+        or rect.bottom <= rect.top
+    ):
+        print("[恢复] 窗口已不再符合主窗口条件，未执行操作。")
         return
     if move:
         if target.on_screen or target.minimized:
@@ -1492,7 +1598,7 @@ def startup_flow(package: PackageInfo, codex_bin_root: Path, runtime_root: Path,
                 if any(w.cloaked for w in fresh.windows):
                     print("窗口被 DWM 隐藏，请先手动切换虚拟桌面。")
                     continue
-                stop_codex_processes(package.install_location, runtime_root, codex_bin_root)
+                stop_codex_processes(package, runtime_root, codex_bin_root)
                 environment = os.environ.copy()
                 environment["CODEX_SPARKLE_ENABLED"] = "false"
                 # https://github.com/openai/codex/issues/41073 (version-specific workaround)
@@ -1602,7 +1708,7 @@ def main() -> int:
         print("[取消] 未执行任何修改。")
         return EXIT_CANCELLED
 
-    stop_codex_processes(package.install_location, runtime_root, codex_bin_root)
+    stop_codex_processes(package, runtime_root, codex_bin_root)
     backup_root: Path | None = None
 
     if not current_valid:
