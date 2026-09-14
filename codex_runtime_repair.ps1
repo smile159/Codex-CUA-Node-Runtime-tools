@@ -665,15 +665,9 @@ function Assert-DiskSpace {
     if ($drive.AvailableFreeSpace -lt $required) { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "磁盘空间不足：需要至少 $(Format-Bytes $required)，当前可用 $(Format-Bytes $drive.AvailableFreeSpace)。" }
 }
 
-function Set-CopiedAttributes {
-    param([string]$Source, [string]$Target, [bool]$Directory)
-    $sourcePath = ConvertTo-ExtendedPath $Source; $targetPath = ConvertTo-ExtendedPath $Target
-    [IO.File]::SetCreationTimeUtc($targetPath, [IO.File]::GetCreationTimeUtc($sourcePath)); [IO.File]::SetLastAccessTimeUtc($targetPath, [IO.File]::GetLastAccessTimeUtc($sourcePath)); [IO.File]::SetLastWriteTimeUtc($targetPath, [IO.File]::GetLastWriteTimeUtc($sourcePath)); [IO.File]::SetAttributes($targetPath, [IO.File]::GetAttributes($sourcePath))
-}
-
 function Copy-RuntimeTree {
     param([string]$SourceRoot, $Snapshot, [string]$RepairRoot)
-    $warnings = [Collections.Generic.List[string]]::new(); [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $RepairRoot)) | Out-Null
+    [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $RepairRoot)) | Out-Null
     foreach ($relative in @($Snapshot.Directories | Sort-Object { ($_ -split '/').Count }, { $_ })) { [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath (Join-RelativePath $RepairRoot $relative))) | Out-Null }
     $items = @($Snapshot.Files.GetEnumerator() | Sort-Object Key); [long]$copied = 0; $timer = [Diagnostics.Stopwatch]::StartNew(); [double]$lastUpdate = 0; $lastWidth = 0; $buffer = New-Object byte[] $script:COPY_BUFFER_SIZE
     for ($index = 0; $index -lt $items.Count; $index++) {
@@ -689,12 +683,8 @@ function Copy-RuntimeTree {
                 }
             } finally { $outputStream.Dispose() }
         } finally { $inputStream.Dispose() }
-        try { Set-CopiedAttributes $sourcePath $targetPath $false } catch { $warnings.Add("未能完整保留文件属性：$relative（$($_.Exception.Message)）") }
     }
     Show-CopyProgress $items.Count $items.Count $copied $Snapshot.TotalBytes $timer.Elapsed.TotalSeconds '完成' ([ref]$lastWidth); Write-Host
-    foreach ($relative in @($Snapshot.Directories | Sort-Object { ($_ -split '/').Count }, { $_ } -Descending)) { try { Set-CopiedAttributes (Join-RelativePath $SourceRoot $relative) (Join-RelativePath $RepairRoot $relative) $true } catch { $warnings.Add("未能完整保留目录属性：$relative（$($_.Exception.Message)）") } }
-    try { Set-CopiedAttributes $SourceRoot $RepairRoot $true } catch { $warnings.Add("未能完整保留根目录属性：$($_.Exception.Message)") }
-    return $warnings.ToArray()
 }
 
 function Show-CopyProgress {
@@ -703,7 +693,17 @@ function Show-CopyProgress {
     $etaText = if ($speed -gt 0) { '{0:D2}:{1:D2}' -f [int][Math]::Floor($eta / 60), [int][Math]::Floor($eta % 60) } else { '--:--' }
     $shown = if ($Relative.Length -le 44) { $Relative } else { '…' + $Relative.Substring($Relative.Length - 43) }
     $line = "[复制] {0,6:F2}%  文件 $Index/$TotalFiles  $(Format-Bytes $Copied)/$(Format-Bytes $TotalBytes)  $(Format-Bytes $speed)/s  ETA $etaText  $shown" -f $percent
-    Write-Host ("`r" + $line + (' ' * [Math]::Max($LastWidth.Value - $line.Length, 0))) -NoNewline; $LastWidth.Value = $line.Length
+    try {
+        # 留出余量，避免中文宽字符或控制台边界触发自动换行；Console.Write 可确保回车原地刷新。
+        $maximum = [Math]::Max([Console]::BufferWidth - 8, 1)
+        if ($line.Length -gt $maximum) { $line = if ($maximum -eq 1) { '.' } else { $line.Substring(0, $maximum - 1) + '…' } }
+        $width = [Math]::Min([Math]::Max([int]$LastWidth.Value, $line.Length), $maximum)
+        [Console]::Write("`r" + $line.PadRight($width))
+        $LastWidth.Value = $line.Length
+    } catch {
+        Write-Host ("`r" + $line + (' ' * [Math]::Max([int]$LastWidth.Value - $line.Length, 0))) -NoNewline
+        $LastWidth.Value = $line.Length
+    }
 }
 
 function Test-PathWithin {
@@ -745,11 +745,11 @@ function Stop-CodexProcesses {
     $known = [Collections.Generic.HashSet[int]]::new($selection.Targets)
     Write-Host "[进程] 正在关闭 $($selection.Targets.Count) 个 Codex 相关进程……"; [CodexRuntimeRepair.NativeMethods]::PostClose([int[]]@($selection.Chat))
     $deadline = [DateTime]::UtcNow.AddSeconds(5); $remaining = $selection.Targets
-    do { Start-Sleep -Milliseconds 250; $current = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses(); $selected = (Select-CodexProcesses $current $Package $RuntimeRoot $CodexBinRoot).Targets; foreach ($id in $selected) { [void]$known.Add($id) }; $currentIds = [Collections.Generic.HashSet[int]]::new([int[]]@($current.Pid)); $remaining = [Collections.Generic.HashSet[int]]::new(); foreach ($id in $known) { if ($currentIds.Contains($id)) { [void]$remaining.Add($id) } }; if (-not $remaining.Count) { Write-Host '[进程] Codex 已正常关闭。'; return } } while ([DateTime]::UtcNow -lt $deadline)
+    do { Start-Sleep -Milliseconds 250; $current = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses(); $selected = (Select-CodexProcesses $current $Package $RuntimeRoot $CodexBinRoot).Targets; foreach ($id in $selected) { [void]$known.Add($id) }; $currentIds = [Collections.Generic.HashSet[int]]::new([int[]]@($current | ForEach-Object { $_.Pid })); $remaining = [Collections.Generic.HashSet[int]]::new(); foreach ($id in $known) { if ($currentIds.Contains($id)) { [void]$remaining.Add($id) } }; if (-not $remaining.Count) { Write-Host '[进程] Codex 已正常关闭。'; return } } while ([DateTime]::UtcNow -lt $deadline)
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
         $byPid = @{}; foreach ($item in $current) { $byPid[$item.Pid] = $item }; foreach ($id in @($remaining | Sort-Object { Get-ProcessDepth $_ $byPid } -Descending)) { [void][CodexRuntimeRepair.NativeMethods]::Terminate($id) }
-        Start-Sleep -Milliseconds 250; $current = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses(); $selected = (Select-CodexProcesses $current $Package $RuntimeRoot $CodexBinRoot).Targets; foreach ($id in $selected) { [void]$known.Add($id) }; $currentIds = [Collections.Generic.HashSet[int]]::new([int[]]@($current.Pid)); $remaining = [Collections.Generic.HashSet[int]]::new(); foreach ($id in $known) { if ($currentIds.Contains($id)) { [void]$remaining.Add($id) } }
+        Start-Sleep -Milliseconds 250; $current = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses(); $selected = (Select-CodexProcesses $current $Package $RuntimeRoot $CodexBinRoot).Targets; foreach ($id in $selected) { [void]$known.Add($id) }; $currentIds = [Collections.Generic.HashSet[int]]::new([int[]]@($current | ForEach-Object { $_.Pid })); $remaining = [Collections.Generic.HashSet[int]]::new(); foreach ($id in $known) { if ($currentIds.Contains($id)) { [void]$remaining.Add($id) } }
     } while ($remaining.Count -and [DateTime]::UtcNow -lt $deadline)
     if ($remaining.Count) { Throw-RepairError $script:EXIT_PROCESS_OR_ACTIVATION ('无法关闭全部 Codex 相关进程（PID：' + (@($remaining | Sort-Object) -join ', ') + '）。正式 runtime 未修改；请手工关闭 Codex 后重试。') }
     Write-Host '[进程] Codex 相关进程已关闭。'
@@ -800,7 +800,7 @@ function Test-WindowReady { param($Window) return $Window.Visible -and -not $Win
 function Get-StartupState {
     param($Package, [string]$CodexBinRoot)
     try { $processes = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses() } catch { return [pscustomobject]@{ Windows = @(); ProcessCount = 0; Renderer = $false; AppServer = $false; Errors = @("进程查询失败：$($_.Exception.Message)"); Ready = $false } }
-    $app = @($processes | Where-Object { Test-CurrentAppProcess $_ $Package }); $appIds = [Collections.Generic.HashSet[int]]::new([int[]]@($app.Pid)); $descendants = Get-Descendants $appIds $processes
+    $app = @($processes | Where-Object { Test-CurrentAppProcess $_ $Package }); $appIds = [Collections.Generic.HashSet[int]]::new([int[]]@($app | ForEach-Object { $_.Pid })); $descendants = Get-Descendants $appIds $processes
     $renderer = @($app | Where-Object { ([string]$_.CommandLine).Contains('--type=renderer') }).Count -gt 0
     $server = @($processes | Where-Object { $_.Name.Equals('codex.exe', [StringComparison]::OrdinalIgnoreCase) -and ((Test-PathWithin $_.ImagePath $CodexBinRoot) -or (Test-PackageProcess $_ $Package)) -and (([string]$_.CommandLine).ToLowerInvariant().Contains('app-server') -or $descendants.Contains($_.Pid)) }).Count -gt 0
     $errors = [Collections.Generic.List[string]]::new(); if (@($processes | Where-Object { $_.Name.Equals([IO.Path]::GetFileName($Package.ExecutableRelative), [StringComparison]::OrdinalIgnoreCase) -and -not $_.ImagePath -and -not $_.PackageFamilyName }).Count) { $errors.Add('部分同名进程路径无法查询，无法确认其归属') }
@@ -882,8 +882,8 @@ function Invoke-Main {
     Stop-CodexProcesses $package $runtimeRoot $binRoot; $backup = $null
     if (-not $currentValid) {
         [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $runtimeRoot)) | Out-Null; $repairRoot = Get-UniquePath $runtimeRoot ".repair-$selectedId"; Write-Host "[复制] repair 目录：$repairRoot"
-        try { $warnings = @(Copy-RuntimeTree $sourceRoot $snapshot $repairRoot) } catch [System.Management.Automation.PipelineStoppedException] { Write-Host "`n[中断] 复制已中断；正式 runtime 未修改，repair 保留在：$repairRoot"; return $script:EXIT_INTERRUPTED } catch { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "复制失败：$($_.Exception.Message)。正式 runtime 未修改，repair 保留在：$repairRoot" }
-        foreach ($warning in $warnings) { Write-Host "[警告] $warning" }; Write-Host '[校验] 正在核对 repair 的路径、大小和关键文件 SHA256……'; $repairValidation = Compare-Tree $snapshot $hashes $repairRoot; if (-not $repairValidation.Ok) { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "repair 文件校验失败：$($repairValidation.Errors -join '；')。正式 runtime 未修改，repair 保留在：$repairRoot" }
+        try { Copy-RuntimeTree $sourceRoot $snapshot $repairRoot } catch [System.Management.Automation.PipelineStoppedException] { Write-Host "`n[中断] 复制已中断；正式 runtime 未修改，repair 保留在：$repairRoot"; return $script:EXIT_INTERRUPTED } catch { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "复制失败：$($_.Exception.Message)。正式 runtime 未修改，repair 保留在：$repairRoot" }
+        Write-Host '[校验] 正在核对 repair 的路径、大小和关键文件 SHA256……'; $repairValidation = Compare-Tree $snapshot $hashes $repairRoot; if (-not $repairValidation.Ok) { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "repair 文件校验失败：$($repairValidation.Errors -join '；')。正式 runtime 未修改，repair 保留在：$repairRoot" }
         Write-Host '[校验] 正在运行 repair 中的 node.exe --version……'; $repairNode = Test-NodeRuntime $repairRoot $manifest; if (-not $repairNode.Ok) { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "repair Node 测试失败：$($repairNode.Errors -join '；')。正式 runtime 未修改，repair 保留在：$repairRoot" }; Write-Host "[校验] repair 验证通过，Node v$($manifest.NodeVersion.TrimStart('v', 'V')) 可运行。"
         $backup = Move-RuntimeIntoPlace $repairRoot $finalRoot $sourceRoot $snapshot $hashes $manifest
     }
