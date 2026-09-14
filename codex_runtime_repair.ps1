@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
 安全修复 Codex 的 CUA Node runtime，并显示复制进度。
