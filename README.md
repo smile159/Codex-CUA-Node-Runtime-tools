@@ -1,6 +1,6 @@
 # Codex CUA Node Runtime 修复工具
 
-`codex_runtime_repair.py` 是一个仅适用于 Windows 的 Python 修复脚本。它用于修复 Codex 本地运行时目录中损坏、缺失或未完整落盘的 **CUA Node runtime**，并在修复完成后重新启动 Codex、确认主窗口可用。
+`codex_runtime_repair.py` 和 `codex_runtime_repair.ps1` 是两个功能一致、仅适用于 Windows 的修复脚本。它们用于修复 Codex 本地运行时目录中损坏、缺失或未完整落盘的 **CUA Node runtime**，并在修复完成后重新启动 Codex、确认主窗口可用。
 
 脚本以当前已注册的 `OpenAI.Codex` Appx 包中的 `app/resources/cua_node` 作为可信源。它**不会修改** `WindowsApps` 内的官方副本；只有新副本完成文件校验和 Node 可执行性检查后，才会通过重命名将其激活。
 
@@ -18,9 +18,21 @@
 - 关闭已严格识别的 Codex 相关进程、清理相同 ID 的失败 staging，并重新启动及检测 Codex 窗口。
 - 可单独执行启动与窗口健康检测，并针对最小化、隐藏、屏幕外窗口提供交互式恢复选项。
 
+## 典型症状与适用场景
+
+以下情况适合使用本工具：
+
+- 启动 Codex 后长时间没有出现主窗口，但任务管理器中仍能看到 `ChatGPT.exe`、`codex.exe`、`node.exe` 或 `node_repl.exe` 等相关进程。
+- `%LOCALAPPDATA%\OpenAI\Codex\runtimes\cua_node` 下持续存在 `.staging-<16位ID>`（或带后缀的同 ID staging）目录，关闭并重新启动 Codex 后仍未完成转正。这通常表示 runtime 下载、解压或落盘过程未完成。
+- 同一目录下缺少与 staging ID 对应的正式 runtime 目录，或者正式 runtime 存在但缺少文件、文件大小异常、关键可执行文件哈希不一致、`node.exe --version` 无法运行。
+- Codex 进程已经启动，但窗口最小化、被隐藏、位于屏幕外，或窗口状态异常。此时建议先使用 `--startup-only` / `-StartupOnly`，只检测并恢复窗口，不修改 runtime。
+- Codex 没有相关进程且无法正常拉起，或启动后一直无法形成稳定主窗口。仅检测模式会尝试启动应用，并提供重新检测或临时绕过更新器重启的交互选项。
+
+`.staging-*` 目录在正常安装或更新期间可能短暂出现；仅凭目录刚出现不能确定 runtime 已损坏。建议在 Codex 启动持续失败、相关进程存在但没有可用窗口，或 staging 在关闭并重新启动后仍然残留时使用完整修复模式。如果 Codex 窗口和功能均正常，通常无需运行本工具。
+
 ## 运行前注意事项
 
-- **仅支持 Windows。** 需要 Python 3；脚本仅使用标准库，不需要安装第三方依赖。
+- **仅支持 Windows。** Python 版需要 Python 3，PowerShell 版需要 Windows PowerShell 5.1 或 PowerShell 7；两者都不需要安装第三方依赖。
 - 请以可访问当前用户 `LOCALAPPDATA` 和 Appx 包信息的账户运行。脚本通过 PowerShell 的 `Get-AppxPackage` 查询已注册的 `OpenAI.Codex` 包。
 - 修复模式会关闭 Codex 进程：先发送正常关闭请求，超时后才终止仍在运行的已识别进程。请先保存任务、对话和其他未保存内容。
 - 脚本会创建 `.repair-*` 和 `.backup-*` 目录，并删除**同一 runtime ID** 下可验证的 `.staging-*` 目录。不要在这些目录中存放个人文件。
@@ -36,6 +48,18 @@
 python .\codex_runtime_repair.py
 ```
 
+如果电脑没有 Python，或希望直接从 PowerShell 运行，可使用功能一致的 PS1 版本：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\codex_runtime_repair.ps1
+```
+
+在 PowerShell 7 中也可使用：
+
+```powershell
+pwsh.exe -NoProfile -File .\codex_runtime_repair.ps1
+```
+
 默认会提示确认。确认前请关闭或保存重要工作。
 
 常用参数：
@@ -48,13 +72,36 @@ python .\codex_runtime_repair.py
 | `python .\codex_runtime_repair.py --startup-only` | 不处理 runtime，仅启动并检测 Codex 窗口；不需要 runtime ID。 |
 | `python .\codex_runtime_repair.py --startup-timeout 90` | 将每轮窗口健康检测超时设为 90 秒，最小值为 2 秒，默认 60 秒。 |
 
+PS1 版的对应参数如下：
+
+| 命令 | 说明 |
+| --- | --- |
+| `.\codex_runtime_repair.ps1` | 自动从失败 staging 推断 runtime ID，并交互式确认后修复。 |
+| `.\codex_runtime_repair.ps1 -RuntimeId 0123456789abcdef` | 使用指定的 16 位十六进制 runtime ID。 |
+| `.\codex_runtime_repair.ps1 -Yes` | 跳过修复前确认。 |
+| `.\codex_runtime_repair.ps1 -StartupOnly` | 不处理 runtime，仅启动并检测 Codex 窗口。 |
+| `.\codex_runtime_repair.ps1 -StartupTimeout 90` | 将每轮窗口健康检测超时设为 90 秒。 |
+
 建议先使用仅检测模式确认问题是否只是窗口状态：
 
 ```powershell
 python .\codex_runtime_repair.py --startup-only
 ```
 
+或：
+
+```powershell
+.\codex_runtime_repair.ps1 -StartupOnly
+```
+
 若检测到窗口最小化、隐藏或位于屏幕外，按菜单选择恢复操作。若窗口未就绪且并非 DWM 隐藏窗口，脚本还可在本次启动中临时设置 `CODEX_SPARKLE_ENABLED=false` 后重启，以绕过特定版本的更新器问题。
+
+## 如何选择脚本
+
+- 已有 Python 3、需要从命令提示符调用，或希望后续在 Python 环境中复用时，使用 `codex_runtime_repair.py`。
+- 未安装 Python、受限环境只提供 Windows PowerShell，或需要集成到现有 PowerShell 运维流程时，使用 `codex_runtime_repair.ps1`。
+- 两个版本使用相同的可信源、验证规则、进程和窗口识别策略、交互恢复流程及退出码。不要同时运行两个版本；任选其一即可。
+- 若执行策略阻止本地 PS1，可仅对这一次调用使用 `powershell.exe -ExecutionPolicy Bypass -File ...`；这不会永久修改系统执行策略。
 
 ## 实现思路
 
@@ -106,4 +153,5 @@ python .\codex_runtime_repair.py --startup-only
 ## 生成文件
 
 - `codex_runtime_repair.py`：修复脚本。
+- `codex_runtime_repair.ps1`：与 Python 版功能一致的 PowerShell 修复脚本。
 - `assets/codex-runtime-repair-flow.png`：基于脚本真实分支生成的完整运行流程图。
