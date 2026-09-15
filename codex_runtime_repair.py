@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 from typing import Iterable
+import unicodedata
 import xml.etree.ElementTree as ET
 
 
@@ -507,6 +508,33 @@ def shorten(value: str, maximum: int = 44) -> str:
     return "…" + value[-(maximum - 1) :]
 
 
+def console_text_width(value: str) -> int:
+    return sum(
+        0 if unicodedata.combining(character) else 2
+        if unicodedata.east_asian_width(character) in {"F", "W"}
+        else 1
+        for character in value
+    )
+
+
+def fit_console_text(value: str, maximum: int) -> str:
+    if console_text_width(value) <= maximum:
+        return value
+    if maximum <= 1:
+        return "."
+
+    shown: list[str] = []
+    used = 0
+    content_width = maximum - console_text_width("…")
+    for character in value:
+        character_width = console_text_width(character)
+        if used + character_width > content_width:
+            break
+        shown.append(character)
+        used += character_width
+    return "".join(shown) + "…"
+
+
 class CopyProgress:
     def __init__(self, total_files: int, total_bytes: int):
         self.total_files = total_files
@@ -526,14 +554,28 @@ class CopyProgress:
         eta = remaining / speed if speed > 0 else 0.0
         eta_text = f"{int(eta // 60):02d}:{int(eta % 60):02d}" if speed > 0 else "--:--"
         line = (
-            f"\r[复制] {percent:6.2f}%  文件 {file_index}/{self.total_files}  "
+            f"[复制] {percent:6.2f}%  文件 {file_index}/{self.total_files}  "
             f"{format_bytes(copied_bytes)}/{format_bytes(self.total_bytes)}  "
             f"{format_bytes(speed)}/s  ETA {eta_text}  {shorten(relative)}"
         )
-        padding = " " * max(self.last_width - len(line), 0)
-        sys.stdout.write(line + padding)
+        try:
+            columns = os.get_terminal_size(sys.stdout.fileno()).columns
+        except (AttributeError, OSError, ValueError):
+            maximum = None
+        else:
+            # Leave room for console boundaries and width differences in rendered text.
+            maximum = max(columns - 8, 1)
+
+        if maximum is not None:
+            line = fit_console_text(line, maximum)
+        line_width = console_text_width(line)
+        output_width = max(self.last_width, line_width)
+        if maximum is not None:
+            output_width = min(output_width, maximum)
+        padding = " " * max(output_width - line_width, 0)
+        sys.stdout.write("\r" + line + padding)
         sys.stdout.flush()
-        self.last_width = len(line)
+        self.last_width = line_width
         self.last_update = now
         if force:
             sys.stdout.write("\n")
