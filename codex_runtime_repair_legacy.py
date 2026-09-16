@@ -49,7 +49,6 @@ STAGING_RE = re.compile(
     re.IGNORECASE,
 )
 COPY_BUFFER_SIZE = 4 * 1024 * 1024
-PROGRESS_INTERVAL_SECONDS = 0.25
 DISK_SPACE_MARGIN = 64 * 1024 * 1024
 HEALTH_TIMEOUT_SECONDS = 60
 ERROR_INSUFFICIENT_BUFFER = 122
@@ -360,41 +359,42 @@ def scan_tree(root: Path) -> TreeSnapshot:
     files: dict[str, int] = {}
     total_bytes = 0
 
-    pending: list[tuple[str, str]] = [(extended_root, "")]
-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    while pending:
-        current, relative_parent = pending.pop()
-        with os.scandir(current) as entries:
-            for entry in entries:
-                entry_stat = entry.stat(follow_symlinks=False)
-                is_reparse = bool(
-                    getattr(entry_stat, "st_file_attributes", 0) & reparse_flag
-                )
-                relative = f"{relative_parent}/{entry.name}" if relative_parent else entry.name
-                relative = relative.replace("\\", "/")
-                if is_reparse:
-                    kind = "符号链接或目录联接" if stat.S_ISDIR(entry_stat.st_mode) else "符号链接"
-                    raise OSError(f"不支持复制{kind}：{entry.path}")
-                if stat.S_ISDIR(entry_stat.st_mode):
-                    directories.add(relative)
-                    pending.append((entry.path, relative))
-                else:
-                    files[relative] = entry_stat.st_size
-                    total_bytes += entry_stat.st_size
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for current_text, directory_names, file_names in os.walk(
+        extended_root,
+        followlinks=False,
+        onerror=raise_walk_error,
+    ):
+        current = Path(current_text)
+        for name in list(directory_names):
+            directory_path = current / name
+            if filesystem_is_link(directory_path):
+                raise OSError(f"不支持复制符号链接或目录联接：{directory_path}")
+            relative = os.path.relpath(os.fspath(directory_path), extended_root)
+            directories.add(Path(relative).as_posix())
+
+        for name in file_names:
+            file_path = current / name
+            if filesystem_is_link(file_path):
+                raise OSError(f"不支持复制符号链接：{file_path}")
+            size = filesystem_stat(file_path).st_size
+            relative = Path(os.path.relpath(os.fspath(file_path), extended_root)).as_posix()
+            files[relative] = size
+            total_bytes += size
 
     return TreeSnapshot(frozenset(directories), files, total_bytes)
 
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    buffer = bytearray(COPY_BUFFER_SIZE)
-    view = memoryview(buffer)
-    with open(to_extended_path(path), "rb", buffering=0) as file:
+    with open(to_extended_path(path), "rb") as file:
         while True:
-            size = file.readinto(buffer)
-            if not size:
+            block = file.read(COPY_BUFFER_SIZE)
+            if not block:
                 break
-            digest.update(view[:size])
+            digest.update(block)
     return digest.hexdigest()
 
 
@@ -600,7 +600,7 @@ class CopyProgress:
 
     def update(self, file_index: int, copied_bytes: int, relative: str, force: bool = False) -> None:
         now = time.monotonic()
-        if not force and now - self.last_update < PROGRESS_INTERVAL_SECONDS:
+        if not force and now - self.last_update < 0.1:
             return
         elapsed = max(now - self.started, 0.001)
         speed = copied_bytes / elapsed
@@ -649,27 +649,21 @@ def copy_runtime_tree(
     file_items = sorted(source_snapshot.files.items())
     progress = CopyProgress(len(file_items), source_snapshot.total_bytes)
     copied_bytes = 0
-    buffer = bytearray(COPY_BUFFER_SIZE)
-    view = memoryview(buffer)
 
     for file_index, (relative, _size) in enumerate(file_items, start=1):
         source_path = path_from_relative(source_root, relative)
         target_path = path_from_relative(repair_root, relative)
+        os.makedirs(to_extended_path(target_path.parent), exist_ok=True)
         with (
-            open(to_extended_path(source_path), "rb", buffering=0) as source_file,
-            open(to_extended_path(target_path), "xb", buffering=0) as target_file,
+            open(to_extended_path(source_path), "rb") as source_file,
+            open(to_extended_path(target_path), "xb") as target_file,
         ):
             while True:
-                size = source_file.readinto(buffer)
-                if not size:
+                block = source_file.read(COPY_BUFFER_SIZE)
+                if not block:
                     break
-                written = 0
-                while written < size:
-                    count = target_file.write(view[written:size])
-                    if not count:
-                        raise OSError(f"写入未完成：{target_path}")
-                    written += count
-                copied_bytes += size
+                target_file.write(block)
+                copied_bytes += len(block)
                 progress.update(file_index, copied_bytes, relative)
         try:
             shutil.copystat(
@@ -772,22 +766,17 @@ class UNICODE_STRING(ctypes.Structure):
 
 
 def kernel32() -> ctypes.WinDLL:
-    api = getattr(kernel32, "_cached", None)
-    if api is None:
-        api = ctypes.WinDLL("kernel32", use_last_error=True)
-        setattr(kernel32, "_cached", api)
-    return api
+    return ctypes.WinDLL("kernel32", use_last_error=True)
 
 
 def user32() -> ctypes.WinDLL:
-    api = getattr(user32, "_cached", None)
-    if api is None:
-        api = ctypes.WinDLL("user32", use_last_error=True)
-        setattr(user32, "_cached", api)
-    return api
+    return ctypes.WinDLL("user32", use_last_error=True)
 
 
-def query_process_image_path(api: ctypes.WinDLL, handle: wintypes.HANDLE) -> str | None:
+def query_process_image_path(pid: int) -> str | None:
+    api = kernel32()
+    api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    api.OpenProcess.restype = wintypes.HANDLE
     api.QueryFullProcessImageNameW.argtypes = [
         wintypes.HANDLE,
         wintypes.DWORD,
@@ -795,44 +784,68 @@ def query_process_image_path(api: ctypes.WinDLL, handle: wintypes.HANDLE) -> str
         ctypes.POINTER(wintypes.DWORD),
     ]
     api.QueryFullProcessImageNameW.restype = wintypes.BOOL
-    buffer = ctypes.create_unicode_buffer(MAX_PROCESS_PATH)
-    length = wintypes.DWORD(len(buffer))
-    if not api.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(length)):
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+
+    handle = api.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
         return None
-    return buffer.value
+    try:
+        buffer = ctypes.create_unicode_buffer(MAX_PROCESS_PATH)
+        length = wintypes.DWORD(len(buffer))
+        if not api.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(length)):
+            return None
+        return buffer.value
+    finally:
+        api.CloseHandle(handle)
 
 
-def query_process_package_family_name(
-    api: ctypes.WinDLL,
-    handle: wintypes.HANDLE,
-) -> str | None:
+def query_process_package_family_name(pid: int) -> str | None:
+    api = kernel32()
     try:
         get_package_family_name = api.GetPackageFamilyName
     except AttributeError:
         return None
+    api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    api.OpenProcess.restype = wintypes.HANDLE
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
     get_package_family_name.argtypes = [
         wintypes.HANDLE,
         ctypes.POINTER(wintypes.UINT),
         wintypes.LPWSTR,
     ]
     get_package_family_name.restype = wintypes.LONG
-    length = wintypes.UINT(0)
-    result = get_package_family_name(handle, ctypes.byref(length), None)
-    if result == APPMODEL_ERROR_NO_PACKAGE:
-        return None
-    if result != ERROR_INSUFFICIENT_BUFFER or length.value <= 1:
-        return None
-    buffer = ctypes.create_unicode_buffer(length.value)
-    result = get_package_family_name(handle, ctypes.byref(length), buffer)
-    return buffer.value if result == 0 and buffer.value else None
 
-
-def query_process_command_line(handle: wintypes.HANDLE) -> str | None:
+    handle = api.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
     try:
-        ntdll = getattr(query_process_command_line, "_ntdll", None)
-        if ntdll is None:
-            ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
-            setattr(query_process_command_line, "_ntdll", ntdll)
+        length = wintypes.UINT(0)
+        result = get_package_family_name(handle, ctypes.byref(length), None)
+        if result == APPMODEL_ERROR_NO_PACKAGE:
+            return None
+        if result != ERROR_INSUFFICIENT_BUFFER or length.value <= 1:
+            return None
+        buffer = ctypes.create_unicode_buffer(length.value)
+        result = get_package_family_name(handle, ctypes.byref(length), buffer)
+        return buffer.value if result == 0 and buffer.value else None
+    finally:
+        api.CloseHandle(handle)
+
+
+def query_process_command_line(pid: int) -> str | None:
+    api = kernel32()
+    api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    api.OpenProcess.restype = wintypes.HANDLE
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    handle = api.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+
+    try:
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
         query = ntdll.NtQueryInformationProcess
         query.argtypes = [
             wintypes.HANDLE,
@@ -858,36 +871,11 @@ def query_process_command_line(handle: wintypes.HANDLE) -> str | None:
         return ctypes.wstring_at(value.Buffer, value.Length // ctypes.sizeof(ctypes.c_wchar))
     except (OSError, ValueError):
         return None
-
-
-def query_process_details(
-    pid: int,
-    *,
-    include_command_line: bool,
-    include_package_family: bool,
-) -> tuple[str | None, str | None, str | None]:
-    api = kernel32()
-    api.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    api.OpenProcess.restype = wintypes.HANDLE
-    api.CloseHandle.argtypes = [wintypes.HANDLE]
-    api.CloseHandle.restype = wintypes.BOOL
-    handle = api.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not handle:
-        return None, None, None
-    try:
-        image_path = query_process_image_path(api, handle)
-        command_line = query_process_command_line(handle) if include_command_line else None
-        package_family = (
-            query_process_package_family_name(api, handle)
-            if include_package_family
-            else None
-        )
-        return image_path, command_line, package_family
     finally:
         api.CloseHandle(handle)
 
 
-def enumerate_processes(include_runtime_details: bool = True) -> list[ProcessInfo]:
+def enumerate_processes() -> list[ProcessInfo]:
     api = kernel32()
     api.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
     api.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
@@ -902,8 +890,7 @@ def enumerate_processes(include_runtime_details: bool = True) -> list[ProcessInf
     if snapshot == INVALID_HANDLE_VALUE:
         raise RepairError(EXIT_PROCESS_OR_ACTIVATION, "无法创建 Windows 进程快照。")
 
-    app_names = {"chatgpt.exe", "codex.exe"}
-    runtime_names = {"node.exe", "node_repl.exe"}
+    relevant_names = {"chatgpt.exe", "codex.exe", "node.exe", "node_repl.exe"}
     result: list[ProcessInfo] = []
     try:
         entry = PROCESSENTRY32W()
@@ -911,19 +898,10 @@ def enumerate_processes(include_runtime_details: bool = True) -> list[ProcessInf
         success = api.Process32FirstW(snapshot, ctypes.byref(entry))
         while success:
             name = str(entry.szExeFile)
-            lowered_name = name.lower()
-            if lowered_name in app_names:
-                path, command_line, package_family_name = query_process_details(
-                    entry.th32ProcessID,
-                    include_command_line=True,
-                    include_package_family=True,
-                )
-            elif include_runtime_details and lowered_name in runtime_names:
-                path, command_line, package_family_name = query_process_details(
-                    entry.th32ProcessID,
-                    include_command_line=False,
-                    include_package_family=False,
-                )
+            if name.lower() in relevant_names:
+                path = query_process_image_path(entry.th32ProcessID)
+                command_line = query_process_command_line(entry.th32ProcessID)
+                package_family_name = query_process_package_family_name(entry.th32ProcessID)
             else:
                 path = None
                 command_line = None
@@ -948,43 +926,26 @@ def normalized_path(value: str | Path) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(value)))
 
 
-def is_path_within(
-    path: str | None,
-    root: Path,
-    normalized_root: str | None = None,
-) -> bool:
+def is_path_within(path: str | None, root: Path) -> bool:
     if not path:
         return False
     try:
-        normalized_root = normalized_root or normalized_path(root)
-        return os.path.commonpath([normalized_path(path), normalized_root]) == normalized_root
+        return os.path.commonpath([normalized_path(path), normalized_path(root)]) == normalized_path(root)
     except ValueError:
         return False
 
 
-def is_process_from_package(
-    process: ProcessInfo,
-    package: PackageInfo,
-    normalized_package_root: str | None = None,
-) -> bool:
+def is_process_from_package(process: ProcessInfo, package: PackageInfo) -> bool:
     if process.package_family_name:
         return process.package_family_name.casefold() == package.package_family_name.casefold()
-    return is_path_within(
-        process.image_path,
-        package.install_location,
-        normalized_package_root,
-    )
+    return is_path_within(process.image_path, package.install_location)
 
 
-def is_current_app_process(
-    process: ProcessInfo,
-    package: PackageInfo,
-    normalized_package_root: str | None = None,
-) -> bool:
+def is_current_app_process(process: ProcessInfo, package: PackageInfo) -> bool:
     executable_name = Path(package.executable_relative).name
     return (
         process.name.casefold() == executable_name.casefold()
-        and is_process_from_package(process, package, normalized_package_root)
+        and is_process_from_package(process, package)
     )
 
 
@@ -1106,13 +1067,10 @@ def select_codex_processes(
     runtime_root: Path,
     codex_bin_root: Path,
 ) -> tuple[set[int], set[int]]:
-    normalized_package_root = normalized_path(package.install_location)
-    normalized_runtime_root = normalized_path(runtime_root)
-    normalized_bin_root = normalized_path(codex_bin_root)
     chat_pids = {
         process.pid
         for process in processes
-        if is_current_app_process(process, package, normalized_package_root)
+        if is_current_app_process(process, package)
     }
     descendants = descendants_of(chat_pids, processes)
     target_pids = set(chat_pids)
@@ -1120,13 +1078,13 @@ def select_codex_processes(
     for process in processes:
         lowered_name = process.name.lower()
         if lowered_name in {"node.exe", "node_repl.exe"} and is_path_within(
-            process.image_path, runtime_root, normalized_runtime_root
+            process.image_path, runtime_root
         ):
             target_pids.add(process.pid)
         elif (
             lowered_name == "codex.exe"
-            and (is_path_within(process.image_path, codex_bin_root, normalized_bin_root)
-                 or is_process_from_package(process, package, normalized_package_root))
+            and (is_path_within(process.image_path, codex_bin_root)
+                 or is_process_from_package(process, package))
             and (
                 process.pid in descendants
                 or "app-server" in (process.command_line or "").lower()
@@ -1441,24 +1399,18 @@ def intersects(a, b) -> bool:
 def probe_startup(package: PackageInfo, codex_bin_root: Path) -> StartupState:
     errors: list[str] = []
     try:
-        processes = enumerate_processes(include_runtime_details=False)
+        processes = enumerate_processes()
     except (OSError, RepairError) as exc:
         return StartupState((), 0, False, False, (f"进程查询失败：{exc}",))
     executable = package.install_location / package.executable_relative
-    normalized_package_root = normalized_path(package.install_location)
-    normalized_bin_root = normalized_path(codex_bin_root)
-    app = [
-        p
-        for p in processes
-        if is_current_app_process(p, package, normalized_package_root)
-    ]
+    app = [p for p in processes if is_current_app_process(p, package)]
     app_pids = {p.pid for p in app}
     descendants = descendants_of(app_pids, processes)
     renderer = any("--type=renderer" in (p.command_line or "") for p in app)
     server = any(
         p.name.lower() == "codex.exe"
-        and (is_path_within(p.image_path, codex_bin_root, normalized_bin_root)
-             or is_process_from_package(p, package, normalized_package_root))
+        and (is_path_within(p.image_path, codex_bin_root)
+             or is_process_from_package(p, package))
         and ("app-server" in (p.command_line or "") or p.pid in descendants)
         for p in processes
     )
@@ -1641,10 +1593,7 @@ def recover_window(package: PackageInfo, codex_bin_root: Path, selected: WindowS
     if target is None or target.cloaked:
         print("[恢复] 窗口已消失或状态已变化，请重新检测。")
         return
-    process = next(
-        (p for p in enumerate_processes(include_runtime_details=False) if p.pid == target.pid),
-        None,
-    )
+    process = next((p for p in enumerate_processes() if p.pid == target.pid), None)
     if process is None or not is_current_app_process(process, package):
         print("[恢复] 无法确认当前应用进程身份，未操作窗口。")
         return

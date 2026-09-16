@@ -49,7 +49,6 @@ $script:EXIT_HEALTH = 50
 $script:EXIT_UNEXPECTED = 99
 $script:EXIT_INTERRUPTED = 130
 $script:COPY_BUFFER_SIZE = 4MB
-$script:PROGRESS_INTERVAL_SECONDS = 0.25
 $script:DISK_SPACE_MARGIN = 64MB
 $script:RuntimeIdPattern = '^[0-9a-fA-F]{16}$'
 $script:StagingPattern = '^\.staging-([0-9a-fA-F]{16})(?:[^0-9a-fA-F].*)?$'
@@ -145,9 +144,7 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
-using System.IO;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Text;
 
 namespace CodexRuntimeRepair {
@@ -176,17 +173,6 @@ namespace CodexRuntimeRepair {
     public sealed class NativeWindowProbe {
         public NativeWindowInfo[] Windows;
         public string[] Errors;
-    }
-
-    public sealed class NativeFileInfo {
-        public string RelativePath;
-        public long Length;
-    }
-
-    public sealed class NativeTreeSnapshot {
-        public string[] Directories;
-        public NativeFileInfo[] Files;
-        public long TotalBytes;
     }
 
     public static class NativeMethods {
@@ -306,22 +292,32 @@ namespace CodexRuntimeRepair {
             return IntPtr.Size == 8 ? GetWindowLongPtr64(hwnd, GWL_EXSTYLE) : GetWindowLong32(hwnd, GWL_EXSTYLE);
         }
 
-        static string QueryImagePath(IntPtr handle) {
-            StringBuilder value = new StringBuilder(32768);
-            uint length = (uint)value.Capacity;
-            return QueryFullProcessImageNameW(handle, 0, value, ref length) ? value.ToString() : null;
+        static string QueryImagePath(int pid) {
+            IntPtr handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+            if (handle == IntPtr.Zero) return null;
+            try {
+                StringBuilder value = new StringBuilder(32768);
+                uint length = (uint)value.Capacity;
+                return QueryFullProcessImageNameW(handle, 0, value, ref length) ? value.ToString() : null;
+            } finally { CloseHandle(handle); }
         }
 
-        static string QueryPackageFamilyName(IntPtr handle) {
-            uint length = 0;
-            int result = GetPackageFamilyName(handle, ref length, null);
-            if (result == APPMODEL_ERROR_NO_PACKAGE || result != ERROR_INSUFFICIENT_BUFFER || length <= 1) return null;
-            StringBuilder value = new StringBuilder((int)length);
-            result = GetPackageFamilyName(handle, ref length, value);
-            return result == 0 && value.Length > 0 ? value.ToString() : null;
+        static string QueryPackageFamilyName(int pid) {
+            IntPtr handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+            if (handle == IntPtr.Zero) return null;
+            try {
+                uint length = 0;
+                int result = GetPackageFamilyName(handle, ref length, null);
+                if (result == APPMODEL_ERROR_NO_PACKAGE || result != ERROR_INSUFFICIENT_BUFFER || length <= 1) return null;
+                StringBuilder value = new StringBuilder((int)length);
+                result = GetPackageFamilyName(handle, ref length, value);
+                return result == 0 && value.Length > 0 ? value.ToString() : null;
+            } finally { CloseHandle(handle); }
         }
 
-        static string QueryCommandLine(IntPtr handle) {
+        static string QueryCommandLine(int pid) {
+            IntPtr handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)pid);
+            if (handle == IntPtr.Zero) return null;
             IntPtr buffer = IntPtr.Zero;
             try {
                 uint needed;
@@ -336,20 +332,11 @@ namespace CodexRuntimeRepair {
             } catch { return null; }
             finally {
                 if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+                CloseHandle(handle);
             }
         }
 
-        static void PopulateProcessDetails(NativeProcessInfo item, bool includeCommandLine, bool includePackageFamily) {
-            IntPtr handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (uint)item.Pid);
-            if (handle == IntPtr.Zero) return;
-            try {
-                item.ImagePath = QueryImagePath(handle);
-                if (includeCommandLine) item.CommandLine = QueryCommandLine(handle);
-                if (includePackageFamily) item.PackageFamilyName = QueryPackageFamilyName(handle);
-            } finally { CloseHandle(handle); }
-        }
-
-        public static NativeProcessInfo[] EnumerateProcesses(bool includeRuntimeDetails) {
+        public static NativeProcessInfo[] EnumerateProcesses() {
             IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (snapshot == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
             List<NativeProcessInfo> result = new List<NativeProcessInfo>();
@@ -360,61 +347,21 @@ namespace CodexRuntimeRepair {
                 while (success) {
                     string name = entry.szExeFile ?? String.Empty;
                     string lowered = name.ToLowerInvariant();
+                    bool relevant = lowered == "chatgpt.exe" || lowered == "codex.exe" || lowered == "node.exe" || lowered == "node_repl.exe";
                     NativeProcessInfo item = new NativeProcessInfo();
                     item.Pid = (int)entry.th32ProcessID;
                     item.ParentPid = (int)entry.th32ParentProcessID;
                     item.Name = name;
-                    if (lowered == "chatgpt.exe" || lowered == "codex.exe") PopulateProcessDetails(item, true, true);
-                    else if (includeRuntimeDetails && (lowered == "node.exe" || lowered == "node_repl.exe")) PopulateProcessDetails(item, false, false);
+                    if (relevant) {
+                        item.ImagePath = QueryImagePath(item.Pid);
+                        item.CommandLine = QueryCommandLine(item.Pid);
+                        item.PackageFamilyName = QueryPackageFamilyName(item.Pid);
+                    }
                     result.Add(item);
                     success = Process32NextW(snapshot, ref entry);
                 }
             } finally { CloseHandle(snapshot); }
             return result.ToArray();
-        }
-
-        public static NativeTreeSnapshot ScanTree(string root) {
-            DirectoryInfo rootInfo = new DirectoryInfo(root);
-            if (!rootInfo.Exists) throw new IOException("目录不存在：" + root);
-            List<string> directories = new List<string>();
-            List<NativeFileInfo> files = new List<NativeFileInfo>();
-            Stack<KeyValuePair<DirectoryInfo, string>> pending = new Stack<KeyValuePair<DirectoryInfo, string>>();
-            pending.Push(new KeyValuePair<DirectoryInfo, string>(rootInfo, String.Empty));
-            long totalBytes = 0;
-            while (pending.Count > 0) {
-                KeyValuePair<DirectoryInfo, string> current = pending.Pop();
-                foreach (FileSystemInfo entry in current.Key.EnumerateFileSystemInfos()) {
-                    FileAttributes attributes = entry.Attributes;
-                    bool isDirectory = (attributes & FileAttributes.Directory) != 0;
-                    if ((attributes & FileAttributes.ReparsePoint) != 0) {
-                        throw new IOException("不支持复制" + (isDirectory ? "符号链接或目录联接：" : "符号链接：") + entry.FullName);
-                    }
-                    string relative = current.Value.Length == 0 ? entry.Name : current.Value + "/" + entry.Name;
-                    if (isDirectory) {
-                        directories.Add(relative);
-                        pending.Push(new KeyValuePair<DirectoryInfo, string>((DirectoryInfo)entry, relative));
-                    } else {
-                        FileInfo file = (FileInfo)entry;
-                        NativeFileInfo item = new NativeFileInfo();
-                        item.RelativePath = relative;
-                        item.Length = file.Length;
-                        files.Add(item);
-                        totalBytes += item.Length;
-                    }
-                }
-            }
-            NativeTreeSnapshot result = new NativeTreeSnapshot();
-            result.Directories = directories.ToArray();
-            result.Files = files.ToArray();
-            result.TotalBytes = totalBytes;
-            return result;
-        }
-
-        public static string Sha256File(string path, int bufferSize) {
-            using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, FileOptions.SequentialScan))
-            using (SHA256 sha = SHA256.Create()) {
-                return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", String.Empty).ToLowerInvariant();
-            }
         }
 
         public static int[] EnumerateWindowPids(bool visibleOnly) {
@@ -654,17 +601,38 @@ function Get-RuntimeManifest {
 
 function Get-TreeSnapshot {
     param([string]$Root)
-    $native = [CodexRuntimeRepair.NativeMethods]::ScanTree((ConvertTo-ExtendedPath $Root).TrimEnd('\'))
+    $extendedRoot = (ConvertTo-ExtendedPath $Root).TrimEnd('\')
+    if (-not [IO.Directory]::Exists($extendedRoot)) { throw "目录不存在：$Root" }
     $directories = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $files = [Collections.Generic.Dictionary[string,long]]::new([StringComparer]::Ordinal)
-    foreach ($directory in $native.Directories) { [void]$directories.Add($directory) }
-    foreach ($file in $native.Files) { $files.Add($file.RelativePath, $file.Length) }
-    return [pscustomobject]@{ Directories = $directories; Files = $files; TotalBytes = $native.TotalBytes; OrderedDirectories = $native.Directories; OrderedFiles = $native.Files }
+    [long]$totalBytes = 0
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($extendedRoot)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Pop()
+        foreach ($directory in [IO.Directory]::EnumerateDirectories($current)) {
+            if (([IO.File]::GetAttributes($directory) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "不支持复制符号链接或目录联接：$directory" }
+            $relative = $directory.Substring($extendedRoot.Length).TrimStart('\').Replace('\', '/')
+            [void]$directories.Add($relative)
+            $pending.Push($directory)
+        }
+        foreach ($file in [IO.Directory]::EnumerateFiles($current)) {
+            if (([IO.File]::GetAttributes($file) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "不支持复制符号链接：$file" }
+            $info = [IO.FileInfo]::new($file)
+            $relative = $file.Substring($extendedRoot.Length).TrimStart('\').Replace('\', '/')
+            $files.Add($relative, $info.Length)
+            $totalBytes += $info.Length
+        }
+    }
+    return [pscustomobject]@{ Directories = $directories; Files = $files; TotalBytes = $totalBytes }
 }
 
 function Get-Sha256 {
     param([string]$Path)
-    return [CodexRuntimeRepair.NativeMethods]::Sha256File((ConvertTo-ExtendedPath $Path), $script:COPY_BUFFER_SIZE)
+    $stream = [IO.File]::Open((ConvertTo-ExtendedPath $Path), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose(); $stream.Dispose() }
 }
 
 function Format-Bytes {
@@ -776,17 +744,18 @@ function Assert-DiskSpace {
 function Copy-RuntimeTree {
     param([string]$SourceRoot, $Snapshot, [string]$RepairRoot)
     [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $RepairRoot)) | Out-Null
-    foreach ($relative in $Snapshot.OrderedDirectories) { [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath (Join-RelativePath $RepairRoot $relative))) | Out-Null }
-    $items = $Snapshot.OrderedFiles; [long]$copied = 0; $timer = [Diagnostics.Stopwatch]::StartNew(); [double]$lastUpdate = 0; $lastWidth = 0; $buffer = New-Object byte[] $script:COPY_BUFFER_SIZE
+    foreach ($relative in @($Snapshot.Directories | Sort-Object { ($_ -split '/').Count }, { $_ })) { [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath (Join-RelativePath $RepairRoot $relative))) | Out-Null }
+    $items = @($Snapshot.Files.GetEnumerator() | Sort-Object Key); [long]$copied = 0; $timer = [Diagnostics.Stopwatch]::StartNew(); [double]$lastUpdate = 0; $lastWidth = 0; $buffer = New-Object byte[] $script:COPY_BUFFER_SIZE
     for ($index = 0; $index -lt $items.Count; $index++) {
-        $relative = $items[$index].RelativePath; $sourcePath = Join-RelativePath $SourceRoot $relative; $targetPath = Join-RelativePath $RepairRoot $relative
-        $inputStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $sourcePath), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read, $script:COPY_BUFFER_SIZE, [IO.FileOptions]::SequentialScan)
+        $relative = $items[$index].Key; $sourcePath = Join-RelativePath $SourceRoot $relative; $targetPath = Join-RelativePath $RepairRoot $relative
+        [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath ([IO.Path]::GetDirectoryName($targetPath)))) | Out-Null
+        $inputStream = [IO.File]::Open((ConvertTo-ExtendedPath $sourcePath), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
         try {
-            $outputStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $targetPath), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, $script:COPY_BUFFER_SIZE, [IO.FileOptions]::SequentialScan)
+            $outputStream = [IO.File]::Open((ConvertTo-ExtendedPath $targetPath), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
             try {
                 while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
                     $outputStream.Write($buffer, 0, $read); $copied += $read
-                    if ($timer.Elapsed.TotalSeconds - $lastUpdate -ge $script:PROGRESS_INTERVAL_SECONDS) { Show-CopyProgress ($index + 1) $items.Count $copied $Snapshot.TotalBytes $timer.Elapsed.TotalSeconds $relative ([ref]$lastWidth); $lastUpdate = $timer.Elapsed.TotalSeconds }
+                    if ($timer.Elapsed.TotalSeconds - $lastUpdate -ge 0.1) { Show-CopyProgress ($index + 1) $items.Count $copied $Snapshot.TotalBytes $timer.Elapsed.TotalSeconds $relative ([ref]$lastWidth); $lastUpdate = $timer.Elapsed.TotalSeconds }
                 }
             } finally { $outputStream.Dispose() }
         } finally { $inputStream.Dispose() }
@@ -813,16 +782,14 @@ function Show-CopyProgress {
     }
 }
 
-function Get-NormalizedPath { param([string]$Path) return [IO.Path]::GetFullPath($Path).TrimEnd('\') }
-
 function Test-PathWithin {
-    param([string]$Path, [string]$Root, [string]$NormalizedRoot)
+    param([string]$Path, [string]$Root)
     if (-not $Path) { return $false }
-    try { $full = Get-NormalizedPath $Path; $rootFull = if ($NormalizedRoot) { $NormalizedRoot } else { Get-NormalizedPath $Root }; return $full.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase) } catch { return $false }
+    try { $full = [IO.Path]::GetFullPath($Path).TrimEnd('\'); $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\'); return $full.Equals($rootFull, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase) } catch { return $false }
 }
 
-function Test-PackageProcess { param($Process, $Package, [string]$NormalizedPackageRoot) if ($Process.PackageFamilyName) { return $Process.PackageFamilyName.Equals($Package.PackageFamilyName, [StringComparison]::OrdinalIgnoreCase) }; return Test-PathWithin $Process.ImagePath $Package.InstallLocation $NormalizedPackageRoot }
-function Test-CurrentAppProcess { param($Process, $Package, [string]$NormalizedPackageRoot) return $Process.Name.Equals([IO.Path]::GetFileName($Package.ExecutableRelative), [StringComparison]::OrdinalIgnoreCase) -and (Test-PackageProcess $Process $Package $NormalizedPackageRoot) }
+function Test-PackageProcess { param($Process, $Package) if ($Process.PackageFamilyName) { return $Process.PackageFamilyName.Equals($Package.PackageFamilyName, [StringComparison]::OrdinalIgnoreCase) }; return Test-PathWithin $Process.ImagePath $Package.InstallLocation }
+function Test-CurrentAppProcess { param($Process, $Package) return $Process.Name.Equals([IO.Path]::GetFileName($Package.ExecutableRelative), [StringComparison]::OrdinalIgnoreCase) -and (Test-PackageProcess $Process $Package) }
 
 function Get-Descendants {
     param([Collections.Generic.HashSet[int]]$Roots, $Processes)
@@ -834,13 +801,12 @@ function Get-Descendants {
 
 function Select-CodexProcesses {
     param($Processes, $Package, [string]$RuntimeRoot, [string]$CodexBinRoot)
-    $packageRoot = Get-NormalizedPath $Package.InstallLocation; $runtimeRootFull = Get-NormalizedPath $RuntimeRoot; $binRootFull = Get-NormalizedPath $CodexBinRoot
-    $chat = [Collections.Generic.HashSet[int]]::new(); foreach ($process in $Processes) { if (Test-CurrentAppProcess $process $Package $packageRoot) { [void]$chat.Add($process.Pid) } }
+    $chat = [Collections.Generic.HashSet[int]]::new(); foreach ($process in $Processes) { if (Test-CurrentAppProcess $process $Package) { [void]$chat.Add($process.Pid) } }
     $descendants = Get-Descendants $chat $Processes; $targets = [Collections.Generic.HashSet[int]]::new($chat)
     foreach ($process in $Processes) {
         $name = $process.Name.ToLowerInvariant()
-        if (($name -eq 'node.exe' -or $name -eq 'node_repl.exe') -and (Test-PathWithin $process.ImagePath $RuntimeRoot $runtimeRootFull)) { [void]$targets.Add($process.Pid) }
-        elseif ($name -eq 'codex.exe' -and ((Test-PathWithin $process.ImagePath $CodexBinRoot $binRootFull) -or (Test-PackageProcess $process $Package $packageRoot)) -and ($descendants.Contains($process.Pid) -or ([string]$process.CommandLine).ToLowerInvariant().Contains('app-server'))) { [void]$targets.Add($process.Pid) }
+        if (($name -eq 'node.exe' -or $name -eq 'node_repl.exe') -and (Test-PathWithin $process.ImagePath $RuntimeRoot)) { [void]$targets.Add($process.Pid) }
+        elseif ($name -eq 'codex.exe' -and ((Test-PathWithin $process.ImagePath $CodexBinRoot) -or (Test-PackageProcess $process $Package)) -and ($descendants.Contains($process.Pid) -or ([string]$process.CommandLine).ToLowerInvariant().Contains('app-server'))) { [void]$targets.Add($process.Pid) }
     }
     return [pscustomobject]@{ Chat = $chat; Targets = $targets }
 }
@@ -849,17 +815,17 @@ function Get-ProcessDepth { param([int]$PidValue, $ByPid) $depth = 0; $seen = [C
 
 function Stop-CodexProcesses {
     param($Package, [string]$RuntimeRoot, [string]$CodexBinRoot)
-    try { $processes = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses($true) } catch { Throw-RepairError $script:EXIT_PROCESS_OR_ACTIVATION '无法创建 Windows 进程快照。' }
+    try { $processes = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses() } catch { Throw-RepairError $script:EXIT_PROCESS_OR_ACTIVATION '无法创建 Windows 进程快照。' }
     $selection = Select-CodexProcesses $processes $Package $RuntimeRoot $CodexBinRoot
     if (-not $selection.Targets.Count) { Write-Host '[进程] 未发现需要关闭的 Codex 进程。'; return }
     $known = [Collections.Generic.HashSet[int]]::new($selection.Targets)
     Write-Host "[进程] 正在关闭 $($selection.Targets.Count) 个 Codex 相关进程……"; [CodexRuntimeRepair.NativeMethods]::PostClose([int[]]@($selection.Chat))
     $deadline = [DateTime]::UtcNow.AddSeconds(5); $remaining = $selection.Targets
-    do { Start-Sleep -Milliseconds 250; $current = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses($true); $selected = (Select-CodexProcesses $current $Package $RuntimeRoot $CodexBinRoot).Targets; foreach ($id in $selected) { [void]$known.Add($id) }; $currentIds = [Collections.Generic.HashSet[int]]::new([int[]]@($current | ForEach-Object { $_.Pid })); $remaining = [Collections.Generic.HashSet[int]]::new(); foreach ($id in $known) { if ($currentIds.Contains($id)) { [void]$remaining.Add($id) } }; if (-not $remaining.Count) { Write-Host '[进程] Codex 已正常关闭。'; return } } while ([DateTime]::UtcNow -lt $deadline)
+    do { Start-Sleep -Milliseconds 250; $current = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses(); $selected = (Select-CodexProcesses $current $Package $RuntimeRoot $CodexBinRoot).Targets; foreach ($id in $selected) { [void]$known.Add($id) }; $currentIds = [Collections.Generic.HashSet[int]]::new([int[]]@($current | ForEach-Object { $_.Pid })); $remaining = [Collections.Generic.HashSet[int]]::new(); foreach ($id in $known) { if ($currentIds.Contains($id)) { [void]$remaining.Add($id) } }; if (-not $remaining.Count) { Write-Host '[进程] Codex 已正常关闭。'; return } } while ([DateTime]::UtcNow -lt $deadline)
     $deadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
         $byPid = @{}; foreach ($item in $current) { $byPid[$item.Pid] = $item }; foreach ($id in @($remaining | Sort-Object { Get-ProcessDepth $_ $byPid } -Descending)) { [void][CodexRuntimeRepair.NativeMethods]::Terminate($id) }
-        Start-Sleep -Milliseconds 250; $current = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses($true); $selected = (Select-CodexProcesses $current $Package $RuntimeRoot $CodexBinRoot).Targets; foreach ($id in $selected) { [void]$known.Add($id) }; $currentIds = [Collections.Generic.HashSet[int]]::new([int[]]@($current | ForEach-Object { $_.Pid })); $remaining = [Collections.Generic.HashSet[int]]::new(); foreach ($id in $known) { if ($currentIds.Contains($id)) { [void]$remaining.Add($id) } }
+        Start-Sleep -Milliseconds 250; $current = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses(); $selected = (Select-CodexProcesses $current $Package $RuntimeRoot $CodexBinRoot).Targets; foreach ($id in $selected) { [void]$known.Add($id) }; $currentIds = [Collections.Generic.HashSet[int]]::new([int[]]@($current | ForEach-Object { $_.Pid })); $remaining = [Collections.Generic.HashSet[int]]::new(); foreach ($id in $known) { if ($currentIds.Contains($id)) { [void]$remaining.Add($id) } }
     } while ($remaining.Count -and [DateTime]::UtcNow -lt $deadline)
     if ($remaining.Count) { Throw-RepairError $script:EXIT_PROCESS_OR_ACTIVATION ('无法关闭全部 Codex 相关进程（PID：' + (@($remaining | Sort-Object) -join ', ') + '）。正式 runtime 未修改；请手工关闭 Codex 后重试。') }
     Write-Host '[进程] Codex 相关进程已关闭。'
@@ -909,11 +875,10 @@ function Test-WindowReady { param($Window) return $Window.Visible -and -not $Win
 
 function Get-StartupState {
     param($Package, [string]$CodexBinRoot)
-    try { $processes = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses($false) } catch { return [pscustomobject]@{ Windows = @(); ProcessCount = 0; Renderer = $false; AppServer = $false; Errors = @("进程查询失败：$($_.Exception.Message)"); Ready = $false } }
-    $packageRoot = Get-NormalizedPath $Package.InstallLocation; $binRootFull = Get-NormalizedPath $CodexBinRoot
-    $app = @($processes | Where-Object { Test-CurrentAppProcess $_ $Package $packageRoot }); $appIds = [Collections.Generic.HashSet[int]]::new([int[]]@($app | ForEach-Object { $_.Pid })); $descendants = Get-Descendants $appIds $processes
+    try { $processes = [CodexRuntimeRepair.NativeMethods]::EnumerateProcesses() } catch { return [pscustomobject]@{ Windows = @(); ProcessCount = 0; Renderer = $false; AppServer = $false; Errors = @("进程查询失败：$($_.Exception.Message)"); Ready = $false } }
+    $app = @($processes | Where-Object { Test-CurrentAppProcess $_ $Package }); $appIds = [Collections.Generic.HashSet[int]]::new([int[]]@($app | ForEach-Object { $_.Pid })); $descendants = Get-Descendants $appIds $processes
     $renderer = @($app | Where-Object { ([string]$_.CommandLine).Contains('--type=renderer') }).Count -gt 0
-    $server = @($processes | Where-Object { $_.Name.Equals('codex.exe', [StringComparison]::OrdinalIgnoreCase) -and ((Test-PathWithin $_.ImagePath $CodexBinRoot $binRootFull) -or (Test-PackageProcess $_ $Package $packageRoot)) -and (([string]$_.CommandLine).ToLowerInvariant().Contains('app-server') -or $descendants.Contains($_.Pid)) }).Count -gt 0
+    $server = @($processes | Where-Object { $_.Name.Equals('codex.exe', [StringComparison]::OrdinalIgnoreCase) -and ((Test-PathWithin $_.ImagePath $CodexBinRoot) -or (Test-PackageProcess $_ $Package)) -and (([string]$_.CommandLine).ToLowerInvariant().Contains('app-server') -or $descendants.Contains($_.Pid)) }).Count -gt 0
     $errors = [Collections.Generic.List[string]]::new(); if (@($processes | Where-Object { $_.Name.Equals([IO.Path]::GetFileName($Package.ExecutableRelative), [StringComparison]::OrdinalIgnoreCase) -and -not $_.ImagePath -and -not $_.PackageFamilyName }).Count) { $errors.Add('部分同名进程路径无法查询，无法确认其归属') }
     try { $probe = [CodexRuntimeRepair.NativeMethods]::ProbeWindows([int[]]@($appIds)); $windows = @($probe.Windows); foreach ($windowError in $probe.Errors) { $errors.Add($windowError) } } catch { $windows = @(); $errors.Add("窗口查询失败：$($_.Exception.Message)") }
     return [pscustomobject]@{ Windows = $windows; ProcessCount = $app.Count; Renderer = $renderer; AppServer = $server; Errors = $errors.ToArray(); Ready = (@($windows | Where-Object { Test-WindowReady $_ }).Count -gt 0) }
@@ -952,7 +917,7 @@ function Restore-CodexWindow {
     param($Package, [string]$CodexBinRoot, $Selected, [bool]$Move)
     $state = Get-StartupState $Package $CodexBinRoot; if ($state.Ready) { Write-Host '[恢复] 已有正常窗口，无需操作。'; return }
     $target = @($state.Windows | Where-Object { $_.Hwnd -eq $Selected.Hwnd -and $_.Pid -eq $Selected.Pid } | Select-Object -First 1); if (-not $target.Count -or $target[0].Cloaked) { Write-Host '[恢复] 窗口已消失或状态已变化，请重新检测。'; return }
-    $process = @([CodexRuntimeRepair.NativeMethods]::EnumerateProcesses($false) | Where-Object Pid -eq $target[0].Pid | Select-Object -First 1); if (-not $process.Count -or -not (Test-CurrentAppProcess $process[0] $Package)) { Write-Host '[恢复] 无法确认当前应用进程身份，未操作窗口。'; return }
+    $process = @([CodexRuntimeRepair.NativeMethods]::EnumerateProcesses() | Where-Object Pid -eq $target[0].Pid | Select-Object -First 1); if (-not $process.Count -or -not (Test-CurrentAppProcess $process[0] $Package)) { Write-Host '[恢复] 无法确认当前应用进程身份，未操作窗口。'; return }
     $message = [CodexRuntimeRepair.NativeMethods]::RecoverWindow($target[0].Hwnd, $target[0].Pid, $Move); if ($message) { Write-Host "[恢复] $message" }
 }
 

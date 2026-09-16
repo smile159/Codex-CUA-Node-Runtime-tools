@@ -1,6 +1,6 @@
 # Codex CUA Node Runtime 修复工具
 
-`codex_runtime_repair.py` 和 `codex_runtime_repair.ps1` 是两个功能一致、仅适用于 Windows 的修复脚本。它们用于修复 Codex 本地运行时目录中损坏、缺失或未完整落盘的 **CUA Node runtime**，并在修复完成后重新启动 Codex、确认主窗口可用。
+本项目提供性能优化版和 Legacy 版两套仅适用于 Windows 的修复脚本。默认的 `codex_runtime_repair.py`、`codex_runtime_repair.ps1` 是性能优化版；`codex_runtime_repair_legacy.py`、`codex_runtime_repair_legacy.ps1` 保留优化前的实现。四个脚本用于修复 Codex 本地运行时目录中损坏、缺失或未完整落盘的 **CUA Node runtime**，并在修复完成后重新启动 Codex、确认主窗口可用。
 
 脚本以当前已注册的 `OpenAI.Codex` Appx 包中的 `app/resources/cua_node` 作为可信源。它**不会修改** `WindowsApps` 内的官方副本；只有新副本完成文件校验和 Node 可执行性检查后，才会通过重命名将其激活。
 
@@ -60,6 +60,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\codex_runtime_repair.p
 pwsh.exe -NoProfile -File .\codex_runtime_repair.ps1
 ```
 
+如需使用保留的 Legacy 实现，可运行：
+
+```powershell
+python .\codex_runtime_repair_legacy.py
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\codex_runtime_repair_legacy.ps1
+```
+
+Legacy 版支持与对应优化版完全相同的命令参数和退出码，只需替换脚本文件名。
+
 默认会提示确认。确认前请关闭或保存重要工作。
 
 常用参数：
@@ -98,10 +107,22 @@ python .\codex_runtime_repair.py --startup-only
 
 ## 如何选择脚本
 
-- 已有 Python 3、需要从命令提示符调用，或希望后续在 Python 环境中复用时，使用 `codex_runtime_repair.py`。
-- 未安装 Python、受限环境只提供 Windows PowerShell，或需要集成到现有 PowerShell 运维流程时，使用 `codex_runtime_repair.ps1`。
-- 两个版本使用相同的可信源、验证规则、进程和窗口识别策略、交互恢复流程及退出码。不要同时运行两个版本；任选其一即可。
+- 默认使用性能优化版：已有 Python 3 时使用 `codex_runtime_repair.py`；只提供 Windows PowerShell 或需要集成到 PowerShell 运维流程时使用 `codex_runtime_repair.ps1`。
+- 需要对照优化前行为时，分别使用 `codex_runtime_repair_legacy.py` 或 `codex_runtime_repair_legacy.ps1`。
+- 四个脚本使用相同的可信源、验证规则、交互恢复流程及退出码。不要同时运行多个版本；任选其一即可。
 - 若执行策略阻止本地 PS1，可仅对这一次调用使用 `powershell.exe -ExecutionPolicy Bypass -File ...`；这不会永久修改系统执行策略。
+
+## 控制台时间信息
+
+脚本控制的每一行非空输出都会以本地时间 `[YYYY-MM-DD HH:mm:ss]` 开头，复制进度和启动检测进度仍会在当前行原地刷新。纯空行不添加时间戳。
+
+无论处理成功、无需操作、用户取消、发生错误还是被 Ctrl+C 中断，脚本退出前都会输出一次总运行时间，例如：
+
+```text
+[2026-09-16 10:30:45] [耗时] 本次运行总耗时：00:01:23.456
+```
+
+总运行时间使用单调计时器计算并包含等待用户输入的时间；小时数不会在超过 24 小时后归零。
 
 ## 实现思路
 
@@ -152,6 +173,8 @@ python .\codex_runtime_repair.py --startup-only
 
 ## 生成文件
 
-- `codex_runtime_repair.py`：修复脚本。
-- `codex_runtime_repair.ps1`：与 Python 版功能一致的 PowerShell 修复脚本。
+- `codex_runtime_repair.py`：Python 性能优化版修复脚本。
+- `codex_runtime_repair.ps1`：PowerShell 性能优化版修复脚本。
+- `codex_runtime_repair_legacy.py`：保留优化前实现的 Python 修复脚本。
+- `codex_runtime_repair_legacy.ps1`：保留优化前实现的 PowerShell 修复脚本。
 - `assets/codex-runtime-repair-flow.png`：基于脚本真实分支生成的完整运行流程图。
