@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import builtins
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from typing import Iterable
 import unicodedata
@@ -194,9 +196,18 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument("--startup-only", action="store_true", help="仅启动和检测窗口，无需 runtime ID。")
     parser.add_argument("--startup-timeout", type=int, default=60, help="每次检测的超时秒数（至少 2，默认 60）。")
+    parser.add_argument(
+        "--copy-workers",
+        type=int,
+        default=8,
+        metavar="N",
+        help="并发复制线程数（1-32，默认 8；仅在需要修复 runtime 时使用）。",
+    )
     args = parser.parse_args()
     if args.startup_timeout < 2:
         parser.error("--startup-timeout 至少为 2 秒")
+    if not 1 <= args.copy_workers <= 32:
+        parser.error("--copy-workers 必须在 1 到 32 之间")
     return args
 
 
@@ -597,20 +608,41 @@ class CopyProgress:
         self.started = time.monotonic()
         self.last_update = 0.0
         self.last_width = 0
+        self.completed_files = 0
+        self.copied_bytes = 0
+        self.lock = threading.Lock()
 
-    def update(self, file_index: int, copied_bytes: int, relative: str, force: bool = False) -> None:
+    def add_bytes(self, size: int, relative: str) -> None:
+        with self.lock:
+            self.copied_bytes += size
+            self._render(relative)
+
+    def complete_file(self, relative: str) -> None:
+        with self.lock:
+            self.completed_files += 1
+            self._render(relative)
+
+    def finish(self) -> None:
+        with self.lock:
+            self._render("完成", force=True)
+
+    def _render(self, relative: str, force: bool = False) -> None:
         now = time.monotonic()
         if not force and now - self.last_update < PROGRESS_INTERVAL_SECONDS:
             return
         elapsed = max(now - self.started, 0.001)
-        speed = copied_bytes / elapsed
-        percent = (copied_bytes / self.total_bytes * 100.0) if self.total_bytes else 100.0
-        remaining = max(self.total_bytes - copied_bytes, 0)
+        speed = self.copied_bytes / elapsed
+        percent = (
+            self.copied_bytes / self.total_bytes * 100.0
+            if self.total_bytes
+            else 100.0
+        )
+        remaining = max(self.total_bytes - self.copied_bytes, 0)
         eta = remaining / speed if speed > 0 else 0.0
         eta_text = f"{int(eta // 60):02d}:{int(eta % 60):02d}" if speed > 0 else "--:--"
         line = (
-            f"[复制] {percent:6.2f}%  文件 {file_index}/{self.total_files}  "
-            f"{format_bytes(copied_bytes)}/{format_bytes(self.total_bytes)}  "
+            f"[复制] {percent:6.2f}%  文件 {self.completed_files}/{self.total_files}  "
+            f"{format_bytes(self.copied_bytes)}/{format_bytes(self.total_bytes)}  "
             f"{format_bytes(speed)}/s  ETA {eta_text}  {shorten(relative)}"
         )
         try:
@@ -639,71 +671,81 @@ def copy_runtime_tree(
     source_root: Path,
     source_snapshot: TreeSnapshot,
     repair_root: Path,
-) -> list[str]:
-    warnings: list[str] = []
+    copy_workers: int,
+) -> None:
     os.mkdir(to_extended_path(repair_root))
 
     for relative in sorted(source_snapshot.directories, key=lambda item: (item.count("/"), item)):
         os.mkdir(to_extended_path(path_from_relative(repair_root, relative)))
 
-    file_items = sorted(source_snapshot.files.items())
+    file_items = sorted(
+        source_snapshot.files.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
     progress = CopyProgress(len(file_items), source_snapshot.total_bytes)
-    copied_bytes = 0
-    buffer = bytearray(COPY_BUFFER_SIZE)
-    view = memoryview(buffer)
+    stop_requested = threading.Event()
+    thread_state = threading.local()
 
-    for file_index, (relative, _size) in enumerate(file_items, start=1):
+    def copy_file(relative: str) -> None:
+        if stop_requested.is_set():
+            return
         source_path = path_from_relative(source_root, relative)
         target_path = path_from_relative(repair_root, relative)
-        with (
-            open(to_extended_path(source_path), "rb", buffering=0) as source_file,
-            open(to_extended_path(target_path), "xb", buffering=0) as target_file,
-        ):
-            while True:
-                size = source_file.readinto(buffer)
-                if not size:
-                    break
-                written = 0
-                while written < size:
-                    count = target_file.write(view[written:size])
-                    if not count:
-                        raise OSError(f"写入未完成：{target_path}")
-                    written += count
-                copied_bytes += size
-                progress.update(file_index, copied_bytes, relative)
         try:
-            shutil.copystat(
-                to_extended_path(source_path),
-                to_extended_path(target_path),
-                follow_symlinks=True,
-            )
+            buffer = getattr(thread_state, "buffer", None)
+            if buffer is None:
+                buffer = bytearray(COPY_BUFFER_SIZE)
+                thread_state.buffer = buffer
+            view = memoryview(buffer)
+            with (
+                open(to_extended_path(source_path), "rb", buffering=0) as source_file,
+                open(to_extended_path(target_path), "xb", buffering=0) as target_file,
+            ):
+                while not stop_requested.is_set():
+                    size = source_file.readinto(buffer)
+                    if not size:
+                        progress.complete_file(relative)
+                        return
+                    written = 0
+                    while written < size:
+                        count = target_file.write(view[written:size])
+                        if not count:
+                            raise OSError(f"写入未完成：{target_path}")
+                        written += count
+                    progress.add_bytes(size, relative)
         except OSError as exc:
-            warnings.append(f"未能完整保留文件属性：{relative}（{exc}）")
+            raise OSError(f"{relative}（{exc}）") from exc
 
-    progress.update(len(file_items), copied_bytes, "完成", force=True)
-
-    for relative in sorted(
-        source_snapshot.directories,
-        key=lambda item: (item.count("/"), item),
-        reverse=True,
-    ):
-        try:
-            shutil.copystat(
-                to_extended_path(path_from_relative(source_root, relative)),
-                to_extended_path(path_from_relative(repair_root, relative)),
-                follow_symlinks=True,
-            )
-        except OSError as exc:
-            warnings.append(f"未能完整保留目录属性：{relative}（{exc}）")
+    executor = ThreadPoolExecutor(
+        max_workers=copy_workers,
+        thread_name_prefix="runtime-copy",
+    )
+    pending: set[Future[None]] = set()
+    remaining = iter(file_items)
     try:
-        shutil.copystat(
-            to_extended_path(source_root),
-            to_extended_path(repair_root),
-            follow_symlinks=True,
-        )
-    except OSError as exc:
-        warnings.append(f"未能完整保留根目录属性：{exc}")
-    return warnings
+        for _index in range(min(copy_workers, len(file_items))):
+            relative, _size = next(remaining)
+            pending.add(executor.submit(copy_file, relative))
+        while pending:
+            completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                future.result()
+            for _index in range(len(completed)):
+                try:
+                    relative, _size = next(remaining)
+                except StopIteration:
+                    break
+                pending.add(executor.submit(copy_file, relative))
+    except BaseException:
+        stop_requested.set()
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True)
+        raise
+    else:
+        executor.shutdown(wait=True)
+
+    progress.finish()
 
 
 def nearest_existing_parent(path: Path) -> Path:
@@ -1873,8 +1915,14 @@ def main() -> int:
         os.makedirs(to_extended_path(runtime_root), exist_ok=True)
         repair_root = unique_named_path(runtime_root, f".repair-{runtime_id}")
         print(f"[复制] repair 目录：{repair_root}")
+        print(f"[复制] 并发线程：{args.copy_workers}")
         try:
-            attribute_warnings = copy_runtime_tree(source_root, source_snapshot, repair_root)
+            copy_runtime_tree(
+                source_root,
+                source_snapshot,
+                repair_root,
+                args.copy_workers,
+            )
         except KeyboardInterrupt:
             print(f"\n[中断] 复制已中断；正式 runtime 未修改，repair 保留在：{repair_root}")
             return EXIT_INTERRUPTED
@@ -1883,9 +1931,6 @@ def main() -> int:
                 EXIT_COPY_OR_VALIDATION,
                 f"复制失败：{exc}。正式 runtime 未修改，repair 保留在：{repair_root}",
             ) from exc
-
-        for warning in attribute_warnings:
-            print(f"[警告] {warning}")
 
         print("[校验] 正在核对 repair 的路径、大小和关键文件 SHA256……")
         repair_validation = verify_tree(

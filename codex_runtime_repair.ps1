@@ -19,6 +19,9 @@ runtime。脚本不会修改 WindowsApps 中的官方副本。
 
 .PARAMETER StartupTimeout
 每次检测的超时秒数，至少为 2，默认 60。
+
+.PARAMETER CopyWorkers
+并发复制线程数，范围 1 到 32，默认 8；仅在需要修复 runtime 时使用。
 #>
 [CmdletBinding()]
 param(
@@ -32,7 +35,11 @@ param(
 
     [Alias('startup-timeout')]
     [ValidateRange(2, [int]::MaxValue)]
-    [int]$StartupTimeout = 60
+    [int]$StartupTimeout = 60,
+
+    [Alias('copy-workers')]
+    [ValidateRange(1, 32)]
+    [int]$CopyWorkers = 8
 )
 
 Set-StrictMode -Version 2.0
@@ -149,6 +156,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace CodexRuntimeRepair {
     public sealed class NativeProcessInfo {
@@ -187,6 +196,92 @@ namespace CodexRuntimeRepair {
         public string[] Directories;
         public NativeFileInfo[] Files;
         public long TotalBytes;
+    }
+
+    public sealed class NativeCopyOperation {
+        readonly string sourceRoot;
+        readonly string targetRoot;
+        readonly NativeFileInfo[] files;
+        readonly int maxDegreeOfParallelism;
+        readonly int bufferSize;
+        readonly CancellationTokenSource cancellation = new CancellationTokenSource();
+        readonly object pathLock = new object();
+        readonly Task task;
+        long copiedBytes;
+        int completedFiles;
+        int failed;
+        string currentRelativePath = String.Empty;
+        Exception firstError;
+
+        internal NativeCopyOperation(string sourceRoot, string targetRoot, NativeFileInfo[] files, int maxDegreeOfParallelism, int bufferSize) {
+            this.sourceRoot = sourceRoot;
+            this.targetRoot = targetRoot;
+            this.files = (NativeFileInfo[])files.Clone();
+            this.maxDegreeOfParallelism = maxDegreeOfParallelism;
+            this.bufferSize = bufferSize;
+            Array.Sort(this.files, delegate(NativeFileInfo left, NativeFileInfo right) {
+                int byLength = right.Length.CompareTo(left.Length);
+                return byLength != 0 ? byLength : StringComparer.Ordinal.Compare(left.RelativePath, right.RelativePath);
+            });
+            task = Task.Factory.StartNew(CopyAll, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+
+        public long CopiedBytes { get { return Interlocked.Read(ref copiedBytes); } }
+        public int CompletedFiles { get { return Volatile.Read(ref completedFiles); } }
+        public bool IsCompleted { get { return task.IsCompleted; } }
+        public string CurrentRelativePath {
+            get { lock (pathLock) { return currentRelativePath; } }
+        }
+
+        public void Cancel() { cancellation.Cancel(); }
+
+        public void WaitForCompletion() {
+            try { task.Wait(); }
+            catch (AggregateException error) {
+                AggregateException flattened = error.Flatten();
+                if (flattened.InnerExceptions.Count > 0) throw flattened.InnerExceptions[0];
+                throw;
+            }
+        }
+
+        void CopyAll() {
+            ParallelOptions options = new ParallelOptions();
+            options.MaxDegreeOfParallelism = maxDegreeOfParallelism;
+            using (ThreadLocal<byte[]> buffers = new ThreadLocal<byte[]>(delegate { return new byte[bufferSize]; })) {
+                Parallel.ForEach(files, options, delegate(NativeFileInfo item, ParallelLoopState state) {
+                    if (cancellation.IsCancellationRequested || Volatile.Read(ref failed) != 0) {
+                        state.Stop();
+                        return;
+                    }
+                    try { CopyOne(item, buffers.Value); }
+                    catch (Exception error) {
+                        IOException wrapped = new IOException("复制文件失败：" + item.RelativePath + "（" + error.Message + "）", error);
+                        if (Interlocked.CompareExchange(ref firstError, wrapped, null) == null) Interlocked.Exchange(ref failed, 1);
+                        state.Stop();
+                    }
+                });
+            }
+            if (cancellation.IsCancellationRequested) throw new OperationCanceledException("复制已取消。");
+            if (firstError != null) throw firstError;
+        }
+
+        void CopyOne(NativeFileInfo item, byte[] buffer) {
+            string relativePath = item.RelativePath.Replace('/', Path.DirectorySeparatorChar);
+            string sourcePath = Path.Combine(sourceRoot, relativePath);
+            string targetPath = Path.Combine(targetRoot, relativePath);
+            lock (pathLock) { currentRelativePath = item.RelativePath; }
+            using (FileStream input = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, FileOptions.SequentialScan))
+            using (FileStream output = new FileStream(targetPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.SequentialScan)) {
+                while (true) {
+                    if (cancellation.IsCancellationRequested || Volatile.Read(ref failed) != 0) return;
+                    int read = input.Read(buffer, 0, buffer.Length);
+                    if (read == 0) break;
+                    output.Write(buffer, 0, read);
+                    Interlocked.Add(ref copiedBytes, read);
+                }
+            }
+            Interlocked.Increment(ref completedFiles);
+        }
     }
 
     public static class NativeMethods {
@@ -415,6 +510,10 @@ namespace CodexRuntimeRepair {
             using (SHA256 sha = SHA256.Create()) {
                 return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", String.Empty).ToLowerInvariant();
             }
+        }
+
+        public static NativeCopyOperation StartParallelCopy(string sourceRoot, string targetRoot, NativeFileInfo[] files, int maxDegreeOfParallelism, int bufferSize) {
+            return new NativeCopyOperation(sourceRoot, targetRoot, files, maxDegreeOfParallelism, bufferSize);
         }
 
         public static int[] EnumerateWindowPids(bool visibleOnly) {
@@ -774,24 +873,35 @@ function Assert-DiskSpace {
 }
 
 function Copy-RuntimeTree {
-    param([string]$SourceRoot, $Snapshot, [string]$RepairRoot)
+    param([string]$SourceRoot, $Snapshot, [string]$RepairRoot, [int]$Workers)
     [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $RepairRoot)) | Out-Null
     foreach ($relative in $Snapshot.OrderedDirectories) { [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath (Join-RelativePath $RepairRoot $relative))) | Out-Null }
-    $items = $Snapshot.OrderedFiles; [long]$copied = 0; $timer = [Diagnostics.Stopwatch]::StartNew(); [double]$lastUpdate = 0; $lastWidth = 0; $buffer = New-Object byte[] $script:COPY_BUFFER_SIZE
-    for ($index = 0; $index -lt $items.Count; $index++) {
-        $relative = $items[$index].RelativePath; $sourcePath = Join-RelativePath $SourceRoot $relative; $targetPath = Join-RelativePath $RepairRoot $relative
-        $inputStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $sourcePath), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read, $script:COPY_BUFFER_SIZE, [IO.FileOptions]::SequentialScan)
-        try {
-            $outputStream = [IO.FileStream]::new((ConvertTo-ExtendedPath $targetPath), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None, $script:COPY_BUFFER_SIZE, [IO.FileOptions]::SequentialScan)
-            try {
-                while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                    $outputStream.Write($buffer, 0, $read); $copied += $read
-                    if ($timer.Elapsed.TotalSeconds - $lastUpdate -ge $script:PROGRESS_INTERVAL_SECONDS) { Show-CopyProgress ($index + 1) $items.Count $copied $Snapshot.TotalBytes $timer.Elapsed.TotalSeconds $relative ([ref]$lastWidth); $lastUpdate = $timer.Elapsed.TotalSeconds }
-                }
-            } finally { $outputStream.Dispose() }
-        } finally { $inputStream.Dispose() }
+    $items = $Snapshot.OrderedFiles; $timer = [Diagnostics.Stopwatch]::StartNew(); [double]$lastUpdate = 0; $lastWidth = 0
+    $operation = [CodexRuntimeRepair.NativeMethods]::StartParallelCopy(
+        (ConvertTo-ExtendedPath $SourceRoot),
+        (ConvertTo-ExtendedPath $RepairRoot),
+        $items,
+        $Workers,
+        $script:COPY_BUFFER_SIZE
+    )
+    try {
+        while (-not $operation.IsCompleted) {
+            if ($timer.Elapsed.TotalSeconds - $lastUpdate -ge $script:PROGRESS_INTERVAL_SECONDS) {
+                $relative = if ($operation.CurrentRelativePath) { $operation.CurrentRelativePath } else { '准备中' }
+                Show-CopyProgress $operation.CompletedFiles $items.Count $operation.CopiedBytes $Snapshot.TotalBytes $timer.Elapsed.TotalSeconds $relative ([ref]$lastWidth)
+                $lastUpdate = $timer.Elapsed.TotalSeconds
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        try { $operation.WaitForCompletion() }
+        catch { if ($_.Exception.InnerException) { throw $_.Exception.InnerException }; throw }
+    } finally {
+        if (-not $operation.IsCompleted) {
+            $operation.Cancel()
+            try { $operation.WaitForCompletion() } catch { }
+        }
     }
-    Show-CopyProgress $items.Count $items.Count $copied $Snapshot.TotalBytes $timer.Elapsed.TotalSeconds '完成' ([ref]$lastWidth); Write-Host
+    Show-CopyProgress $operation.CompletedFiles $items.Count $operation.CopiedBytes $Snapshot.TotalBytes $timer.Elapsed.TotalSeconds '完成' ([ref]$lastWidth); Write-Host
 }
 
 function Show-CopyProgress {
@@ -995,8 +1105,8 @@ function Invoke-Main {
     if (-not (Confirm-Repair $package $selectedId)) { Write-Host '[取消] 未执行任何修改。'; return $script:EXIT_CANCELLED }
     Stop-CodexProcesses $package $runtimeRoot $binRoot; $backup = $null
     if (-not $currentValid) {
-        [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $runtimeRoot)) | Out-Null; $repairRoot = Get-UniquePath $runtimeRoot ".repair-$selectedId"; Write-Host "[复制] repair 目录：$repairRoot"
-        try { Copy-RuntimeTree $sourceRoot $snapshot $repairRoot } catch [System.Management.Automation.PipelineStoppedException] { Write-Host "`n[中断] 复制已中断；正式 runtime 未修改，repair 保留在：$repairRoot"; return $script:EXIT_INTERRUPTED } catch { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "复制失败：$($_.Exception.Message)。正式 runtime 未修改，repair 保留在：$repairRoot" }
+        [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $runtimeRoot)) | Out-Null; $repairRoot = Get-UniquePath $runtimeRoot ".repair-$selectedId"; Write-Host "[复制] repair 目录：$repairRoot"; Write-Host "[复制] 并发线程：$CopyWorkers"
+        try { Copy-RuntimeTree $sourceRoot $snapshot $repairRoot $CopyWorkers } catch [System.Management.Automation.PipelineStoppedException] { Write-Host "`n[中断] 复制已中断；正式 runtime 未修改，repair 保留在：$repairRoot"; return $script:EXIT_INTERRUPTED } catch { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "复制失败：$($_.Exception.Message)。正式 runtime 未修改，repair 保留在：$repairRoot" }
         Write-Host '[校验] 正在核对 repair 的路径、大小和关键文件 SHA256……'; $repairValidation = Compare-Tree $snapshot $hashes $repairRoot; if (-not $repairValidation.Ok) { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "repair 文件校验失败：$($repairValidation.Errors -join '；')。正式 runtime 未修改，repair 保留在：$repairRoot" }
         Write-Host '[校验] 正在运行 repair 中的 node.exe --version……'; $repairNode = Test-NodeRuntime $repairRoot $manifest; if (-not $repairNode.Ok) { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "repair Node 测试失败：$($repairNode.Errors -join '；')。正式 runtime 未修改，repair 保留在：$repairRoot" }; Write-Host "[校验] repair 验证通过，Node v$($manifest.NodeVersion.TrimStart('v', 'V')) 可运行。"
         $backup = Move-RuntimeIntoPlace $repairRoot $finalRoot $sourceRoot $snapshot $hashes $manifest

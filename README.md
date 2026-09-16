@@ -67,7 +67,7 @@ python .\codex_runtime_repair_legacy.py
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\codex_runtime_repair_legacy.ps1
 ```
 
-Legacy 版支持与对应优化版完全相同的命令参数和退出码，只需替换脚本文件名。
+Legacy 版支持原有修复、启动参数和相同退出码，只需替换脚本文件名；并发复制参数仅由性能优化版支持。
 
 默认会提示确认。确认前请关闭或保存重要工作。
 
@@ -80,6 +80,7 @@ Legacy 版支持与对应优化版完全相同的命令参数和退出码，只�
 | `python .\codex_runtime_repair.py --yes` | 跳过修复前确认，适合已确认影响范围的自动化调用。 |
 | `python .\codex_runtime_repair.py --startup-only` | 不处理 runtime，仅启动并检测 Codex 窗口；不需要 runtime ID。 |
 | `python .\codex_runtime_repair.py --startup-timeout 90` | 将每轮窗口健康检测超时设为 90 秒，最小值为 2 秒，默认 60 秒。 |
+| `python .\codex_runtime_repair.py --copy-workers 8` | 设置并发复制线程数，范围 1–32，默认 8；设为 1 可回退到单线程复制。 |
 
 PS1 版的对应参数如下：
 
@@ -90,6 +91,11 @@ PS1 版的对应参数如下：
 | `.\codex_runtime_repair.ps1 -Yes` | 跳过修复前确认。 |
 | `.\codex_runtime_repair.ps1 -StartupOnly` | 不处理 runtime，仅启动并检测 Codex 窗口。 |
 | `.\codex_runtime_repair.ps1 -StartupTimeout 90` | 将每轮窗口健康检测超时设为 90 秒。 |
+| `.\codex_runtime_repair.ps1 -CopyWorkers 8` | 设置并发复制线程数，范围 1–32，默认 8；设为 1 可回退到单线程复制。 |
+
+性能优化版会预先创建目录，再按文件大小从大到小调度复制任务。每个工作线程复用一个 4 MiB 缓冲区，因此默认 8 路并发的传输缓冲区约占 32 MiB；实际进程内存还包含运行时和系统缓冲。复制进度中的文件数表示已经完整落盘的文件数，字节数、速度和 ETA 是所有线程的聚合值。
+
+runtime 只要求文件内容和目录结构正确，因此性能优化版不会复制 WindowsApps 源文件的时间戳、只读标记或 ACL。复制完成后仍会核对完整路径、文件大小和关键文件 SHA256，并运行 `node.exe --version`；验证通过前不会激活 repair 目录。若机械硬盘、实时杀毒软件或存储驱动在高并发下表现不佳，可逐步降低并发数，最低设为 1。
 
 建议先使用仅检测模式确认问题是否只是窗口状态：
 
@@ -109,7 +115,7 @@ python .\codex_runtime_repair.py --startup-only
 
 - 默认使用性能优化版：已有 Python 3 时使用 `codex_runtime_repair.py`；只提供 Windows PowerShell 或需要集成到 PowerShell 运维流程时使用 `codex_runtime_repair.ps1`。
 - 需要对照优化前行为时，分别使用 `codex_runtime_repair_legacy.py` 或 `codex_runtime_repair_legacy.ps1`。
-- 四个脚本使用相同的可信源、验证规则、交互恢复流程及退出码。不要同时运行多个版本；任选其一即可。
+- 四个脚本使用相同的可信源、验证规则、交互恢复流程及退出码；并发复制参数只属于两个性能优化版。不要同时运行多个版本；任选其一即可。
 - 若执行策略阻止本地 PS1，可仅对这一次调用使用 `powershell.exe -ExecutionPolicy Bypass -File ...`；这不会永久修改系统执行策略。
 
 ## 控制台时间信息
