@@ -1,6 +1,6 @@
 # Codex CUA Node Runtime 修复工具
 
-本项目提供性能优化版和 Legacy 版两套仅适用于 Windows 的修复脚本。默认的 `codex_runtime_repair.py`、`codex_runtime_repair.ps1` 是性能优化版；`codex_runtime_repair_legacy.py`、`codex_runtime_repair_legacy.ps1` 保留优化前的实现。四个脚本用于修复 Codex 本地运行时目录中损坏、缺失或未完整落盘的 **CUA Node runtime**，并在修复完成后重新启动 Codex、确认主窗口可用。
+本项目提供 Python 和 PowerShell 两个仅适用于 Windows 的修复脚本：`codex_runtime_repair.py` 和 `codex_runtime_repair.ps1`。它们用于修复 Codex 本地运行时目录中损坏、缺失或未完整落盘的 **CUA Node runtime**，并在修复完成后重新启动 Codex、确认主窗口可用。
 
 脚本以当前已注册的 `OpenAI.Codex` Appx 包中的 `app/resources/cua_node` 作为可信源。它**不会修改** `WindowsApps` 内的官方副本；只有新副本完成文件校验和 Node 可执行性检查后，才会通过重命名将其激活。
 
@@ -17,6 +17,7 @@
 - 将原正式 runtime 保留为 `.backup-<ID>-时间戳`，激活后再次校验；失败时会尝试恢复旧版本。
 - 关闭已严格识别的 Codex 相关进程、清理相同 ID 的失败 staging，并重新启动及检测 Codex 窗口。
 - 可单独执行启动与窗口健康检测，并针对最小化、隐藏、屏幕外窗口提供交互式恢复选项。
+- 将关键事件、错误和运行结果写入脚本旁的 `logs/`，同时保留原有控制台输出。
 
 ## 典型症状与适用场景
 
@@ -59,15 +60,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\codex_runtime_repair.p
 ```powershell
 pwsh.exe -NoProfile -File .\codex_runtime_repair.ps1
 ```
-
-如需使用保留的 Legacy 实现，可运行：
-
-```powershell
-python .\codex_runtime_repair_legacy.py
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\codex_runtime_repair_legacy.ps1
-```
-
-Legacy 版支持原有修复、启动参数和相同退出码，只需替换脚本文件名；并发复制参数仅由性能优化版支持。
 
 默认会提示确认。确认前请关闭或保存重要工作。
 
@@ -113,14 +105,15 @@ python .\codex_runtime_repair.py --startup-only
 
 ## 如何选择脚本
 
-- 默认使用性能优化版：已有 Python 3 时使用 `codex_runtime_repair.py`；只提供 Windows PowerShell 或需要集成到 PowerShell 运维流程时使用 `codex_runtime_repair.ps1`。
-- 需要对照优化前行为时，分别使用 `codex_runtime_repair_legacy.py` 或 `codex_runtime_repair_legacy.ps1`。
-- 四个脚本使用相同的可信源、验证规则、交互恢复流程及退出码；并发复制参数只属于两个性能优化版。不要同时运行多个版本；任选其一即可。
+- 已有 Python 3 时使用 `codex_runtime_repair.py`；只提供 Windows PowerShell 或需要集成到 PowerShell 运维流程时使用 `codex_runtime_repair.ps1`。
+- 两个脚本使用相同的可信源、验证规则、交互恢复流程及退出码，并支持并发复制。不要同时运行两个版本。
 - 若执行策略阻止本地 PS1，可仅对这一次调用使用 `powershell.exe -ExecutionPolicy Bypass -File ...`；这不会永久修改系统执行策略。
 
-## 控制台时间信息
+## 控制台与日志
 
 脚本控制的每一行非空输出都会以本地时间 `[YYYY-MM-DD HH:mm:ss]` 开头，复制进度和启动检测进度仍会在当前行原地刷新。纯空行不添加时间戳。
+
+每次运行会在脚本所在目录的 `logs/` 中创建独立的 UTF-8 日志，文件名包含脚本类型、时间和进程 ID；从其他工作目录启动时位置也不变。日志记录关键步骤、错误、复制完成摘要、窗口检测结果、退出码和耗时，不记录动态进度刷新或用户输入。日志无法创建或写入时，脚本会提示一次并继续仅输出到控制台。旧日志不会自动删除。
 
 无论处理成功、无需操作、用户取消、发生错误还是被 Ctrl+C 中断，脚本退出前都会输出一次总运行时间，例如：
 
@@ -144,7 +137,7 @@ python .\codex_runtime_repair.py --startup-only
 
 ### 2. 完整性验证优先
 
-脚本会对源目录和目标目录建立快照，比较目录集合、文件集合和每个文件的大小；同时验证 `node.exe` 与 `node_repl.exe` 的 SHA256，并执行 `node.exe --version`，检查版本是否符合 manifest。扫描过程中拒绝复制符号链接和目录联接，避免路径逃逸或不确定的复制语义。
+脚本会对源目录和目标目录建立快照，比较目录集合、文件集合和每个文件的大小；同时验证 `node.exe` 与 `node_repl.exe` 的 SHA256，并执行 `node.exe --version`。版本校验优先使用 manifest 的 `node_binary_version`（可执行文件版本）；旧版 manifest 没有该字段时使用 `node_version`。`node_version` 可能包含发行版后缀，并不一定是 `node.exe --version` 的输出。扫描过程中拒绝复制符号链接和目录联接，避免路径逃逸或不确定的复制语义。
 
 ### 3. 先验证、后切换
 
@@ -181,6 +174,5 @@ python .\codex_runtime_repair.py --startup-only
 
 - `codex_runtime_repair.py`：Python 性能优化版修复脚本。
 - `codex_runtime_repair.ps1`：PowerShell 性能优化版修复脚本。
-- `codex_runtime_repair_legacy.py`：保留优化前实现的 Python 修复脚本。
-- `codex_runtime_repair_legacy.ps1`：保留优化前实现的 PowerShell 修复脚本。
+- `logs/`：运行时创建的日志目录，已从版本控制中忽略。
 - `assets/codex-runtime-repair-flow.png`：基于脚本真实分支生成的完整运行流程图。

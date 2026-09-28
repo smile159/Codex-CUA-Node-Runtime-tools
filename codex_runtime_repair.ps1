@@ -62,6 +62,8 @@ $script:RuntimeIdPattern = '^[0-9a-fA-F]{16}$'
 $script:StagingPattern = '^\.staging-([0-9a-fA-F]{16})(?:[^0-9a-fA-F].*)?$'
 $script:RuntimeIdSpecified = $PSBoundParameters.ContainsKey('RuntimeId')
 $script:TimestampPrefixWidth = 22
+$script:LogWriter = $null
+$script:LogWarningShown = $false
 
 function Get-TimestampPrefix {
     return '[{0}] ' -f [DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
@@ -82,6 +84,46 @@ function Add-TimestampToText {
     return $builder.ToString()
 }
 
+function Disable-RunLog {
+    param([string]$Message)
+    if ($null -ne $script:LogWriter) {
+        try { $script:LogWriter.Dispose() } catch { }
+        $script:LogWriter = $null
+    }
+    if (-not $script:LogWarningShown) {
+        $script:LogWarningShown = $true
+        [Console]::Error.WriteLine((Add-TimestampToText "[警告] 日志不可用：${Message}；继续仅输出控制台。"))
+    }
+}
+
+function Write-RunLog {
+    param([AllowEmptyString()][string]$Message)
+    if ($null -eq $script:LogWriter -or [string]::IsNullOrWhiteSpace($Message) -or $Message.Contains("`r")) { return }
+    try {
+        $script:LogWriter.WriteLine($Message)
+        $script:LogWriter.Flush()
+    } catch {
+        Disable-RunLog $_.Exception.Message
+    }
+}
+
+function Initialize-RunLog {
+    $stream = $null
+    try {
+        $logDir = [IO.Path]::Combine($PSScriptRoot, 'logs')
+        [void][IO.Directory]::CreateDirectory($logDir)
+        $name = 'codex_runtime_repair_ps1_{0}_{1}_{2}.log' -f [DateTime]::Now.ToString('yyyyMMdd-HHmmss'), $PID, [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $logPath = [IO.Path]::Combine($logDir, $name)
+        $stream = [IO.File]::Open($logPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        $script:LogWriter = [IO.StreamWriter]::new($stream, [Text.UTF8Encoding]::new($false))
+        return $logPath
+    } catch {
+        if ($null -ne $stream -and $null -eq $script:LogWriter) { try { $stream.Dispose() } catch { } }
+        Disable-RunLog $_.Exception.Message
+        return $null
+    }
+}
+
 function Write-Host {
     [CmdletBinding()]
     param(
@@ -97,32 +139,40 @@ function Write-Host {
         return
     }
     $text = (($Object | ForEach-Object { [string]$_ }) -join [string]$Separator)
+    $formatted = Add-TimestampToText $text
     $parameters = @{
-        Object = (Add-TimestampToText $text)
+        Object = $formatted
         NoNewline = $NoNewline
     }
     if ($PSBoundParameters.ContainsKey('ForegroundColor')) { $parameters.ForegroundColor = $ForegroundColor }
     if ($PSBoundParameters.ContainsKey('BackgroundColor')) { $parameters.BackgroundColor = $BackgroundColor }
     Microsoft.PowerShell.Utility\Write-Host @parameters
+    if (-not $NoNewline) { Write-RunLog $formatted }
 }
 
 function Read-Host {
     [CmdletBinding()]
     param([Parameter(Position = 0)][string]$Prompt)
     if ($PSBoundParameters.ContainsKey('Prompt')) {
-        return (Microsoft.PowerShell.Utility\Read-Host -Prompt (Add-TimestampToText $Prompt))
+        $formatted = Add-TimestampToText $Prompt
+        Write-RunLog $formatted
+        return (Microsoft.PowerShell.Utility\Read-Host -Prompt $formatted)
     }
     return (Microsoft.PowerShell.Utility\Read-Host)
 }
 
 function Write-TimestampedError {
     param([AllowEmptyString()][string]$Message)
-    [Console]::Error.WriteLine((Add-TimestampToText $Message))
+    $formatted = Add-TimestampToText $Message
+    [Console]::Error.WriteLine($formatted)
+    Write-RunLog $formatted
 }
 
 function Write-TimestampedOutput {
     param([AllowEmptyString()][string]$Message)
-    [Console]::Out.WriteLine((Add-TimestampToText $Message))
+    $formatted = Add-TimestampToText $Message
+    [Console]::Out.WriteLine($formatted)
+    Write-RunLog $formatted
 }
 
 function Format-Elapsed {
@@ -746,9 +796,11 @@ function Get-RuntimeManifest {
     $replPath = Normalize-ManifestRelativePath $data.node_repl_path 'node_repl_path'
     $nodeVersion = [string]$data.node_version
     if ([string]::IsNullOrWhiteSpace($nodeVersion)) { Throw-RepairError $script:EXIT_DISCOVERY 'cua_node manifest 缺少有效字段：node_version' }
+    $nodeBinaryVersion = if ($null -ne $data.PSObject.Properties['node_binary_version']) { [string]$data.node_binary_version } else { $nodeVersion }
+    if ([string]::IsNullOrWhiteSpace($nodeBinaryVersion)) { Throw-RepairError $script:EXIT_DISCOVERY 'cua_node manifest 缺少有效字段：node_binary_version' }
     $missing = @($nodePath, $replPath | Where-Object { -not (Test-FsFile (Join-RelativePath $SourceRoot $_)) } | ForEach-Object { Join-RelativePath $SourceRoot $_ })
     if ($missing.Count -gt 0) { Throw-RepairError $script:EXIT_DISCOVERY ('官方 cua_node 源目录缺少关键文件：' + ($missing -join ', ')) }
-    return [pscustomobject]@{ NodeRelativePath = $nodePath; ReplRelativePath = $replPath; NodeVersion = $nodeVersion.Trim() }
+    return [pscustomobject]@{ NodeRelativePath = $nodePath; ReplRelativePath = $replPath; NodeBinaryVersion = $nodeBinaryVersion.Trim() }
 }
 
 function Get-TreeSnapshot {
@@ -824,7 +876,7 @@ function Test-NodeRuntime {
         if (-not $process.WaitForExit(15000)) { try { $process.Kill() } catch {}; return [pscustomobject]@{ Ok = $false; Errors = @('Node 测试无法执行：操作超时') } }
         $stdout = $process.StandardOutput.ReadToEnd().Trim(); $stderr = $process.StandardError.ReadToEnd().Trim()
         $actual = if ($stdout) { $stdout } else { $stderr }
-        $expected = $Manifest.NodeVersion.TrimStart('v', 'V'); $normalized = $actual.TrimStart('v', 'V')
+        $expected = $Manifest.NodeBinaryVersion.TrimStart('v', 'V'); $normalized = $actual.TrimStart('v', 'V')
         if ($process.ExitCode -ne 0) { return [pscustomobject]@{ Ok = $false; Errors = @("node.exe --version 返回退出码 $($process.ExitCode)：$actual") } }
         if ($normalized -cne $expected) { return [pscustomobject]@{ Ok = $false; Errors = @("Node 版本不一致：期望 v$expected，实际 $(if ($actual) {$actual} else {'<空>'})") } }
         return [pscustomobject]@{ Ok = $true; Errors = @() }
@@ -902,6 +954,7 @@ function Copy-RuntimeTree {
         }
     }
     Show-CopyProgress $operation.CompletedFiles $items.Count $operation.CopiedBytes $Snapshot.TotalBytes $timer.Elapsed.TotalSeconds '完成' ([ref]$lastWidth); Write-Host
+    Write-RunLog (Add-TimestampToText "[复制] 完成：文件 $($operation.CompletedFiles)/$($items.Count)，$(Format-Bytes $operation.CopiedBytes)/$(Format-Bytes $Snapshot.TotalBytes)，耗时 $(Format-Elapsed $timer.Elapsed.TotalSeconds)")
 }
 
 function Show-CopyProgress {
@@ -1108,7 +1161,7 @@ function Invoke-Main {
         [IO.Directory]::CreateDirectory((ConvertTo-ExtendedPath $runtimeRoot)) | Out-Null; $repairRoot = Get-UniquePath $runtimeRoot ".repair-$selectedId"; Write-Host "[复制] repair 目录：$repairRoot"; Write-Host "[复制] 并发线程：$CopyWorkers"
         try { Copy-RuntimeTree $sourceRoot $snapshot $repairRoot $CopyWorkers } catch [System.Management.Automation.PipelineStoppedException] { Write-Host "`n[中断] 复制已中断；正式 runtime 未修改，repair 保留在：$repairRoot"; return $script:EXIT_INTERRUPTED } catch { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "复制失败：$($_.Exception.Message)。正式 runtime 未修改，repair 保留在：$repairRoot" }
         Write-Host '[校验] 正在核对 repair 的路径、大小和关键文件 SHA256……'; $repairValidation = Compare-Tree $snapshot $hashes $repairRoot; if (-not $repairValidation.Ok) { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "repair 文件校验失败：$($repairValidation.Errors -join '；')。正式 runtime 未修改，repair 保留在：$repairRoot" }
-        Write-Host '[校验] 正在运行 repair 中的 node.exe --version……'; $repairNode = Test-NodeRuntime $repairRoot $manifest; if (-not $repairNode.Ok) { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "repair Node 测试失败：$($repairNode.Errors -join '；')。正式 runtime 未修改，repair 保留在：$repairRoot" }; Write-Host "[校验] repair 验证通过，Node v$($manifest.NodeVersion.TrimStart('v', 'V')) 可运行。"
+        Write-Host '[校验] 正在运行 repair 中的 node.exe --version……'; $repairNode = Test-NodeRuntime $repairRoot $manifest; if (-not $repairNode.Ok) { Throw-RepairError $script:EXIT_COPY_OR_VALIDATION "repair Node 测试失败：$($repairNode.Errors -join '；')。正式 runtime 未修改，repair 保留在：$repairRoot" }; Write-Host "[校验] repair 验证通过，Node v$($manifest.NodeBinaryVersion.TrimStart('v', 'V')) 可运行。"
         $backup = Move-RuntimeIntoPlace $repairRoot $finalRoot $sourceRoot $snapshot $hashes $manifest
     }
     $cleanupErrors = @(Remove-MatchingStaging $runtimeRoot $selectedId $selection.Candidates); $startupResult = Invoke-StartupFlow $package $binRoot $runtimeRoot $StartupTimeout
@@ -1117,6 +1170,8 @@ function Invoke-Main {
     Write-Host '[完成] runtime 处理完成，应用窗口已确认就绪。'; if ($backup) { Write-Host "[完成] 旧 runtime 备份已保留：$backup" }; return $script:EXIT_SUCCESS
 }
 
+$logPath = Initialize-RunLog
+if ($logPath) { Write-Host "[日志] 文件：$logPath" }
 try { $exitCode = Invoke-Main }
 catch [System.Management.Automation.PipelineStoppedException] { Write-TimestampedError "`n[中断] 用户中断操作。"; $exitCode = $script:EXIT_INTERRUPTED }
 catch {
@@ -1124,5 +1179,12 @@ catch {
     $message = if ($exitCode -eq $script:EXIT_UNEXPECTED) { "未预期错误（$($_.Exception.GetType().Name)）：$($_.Exception.Message)" } else { $_.Exception.Message }
     Write-TimestampedError "[失败] $message"
 }
-finally { Write-TimestampedOutput "[耗时] 本次运行总耗时：$(Format-Elapsed $script:ExecutionTimer.Elapsed.TotalSeconds)" }
+finally {
+    Write-TimestampedOutput "[结束] 退出码：$exitCode"
+    Write-TimestampedOutput "[耗时] 本次运行总耗时：$(Format-Elapsed $script:ExecutionTimer.Elapsed.TotalSeconds)"
+    if ($null -ne $script:LogWriter) {
+        try { $script:LogWriter.Dispose() } catch { Disable-RunLog $_.Exception.Message }
+        $script:LogWriter = $null
+    }
+}
 exit $exitCode

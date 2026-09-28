@@ -27,13 +27,16 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Iterable
+from typing import Iterable, TextIO
 import unicodedata
+import uuid
 import xml.etree.ElementTree as ET
 
 
 SCRIPT_STARTED_AT = time.monotonic()
 TIMESTAMP_PREFIX_WIDTH = 22
+LOG_FILE: TextIO | None = None
+LOG_WARNING_SHOWN = False
 
 EXIT_SUCCESS = 0
 EXIT_NO_ACTION = 10
@@ -85,6 +88,49 @@ def timestamp_text(value: str) -> str:
     return "".join(result)
 
 
+def warn_log_failure(exc: Exception) -> None:
+    global LOG_FILE, LOG_WARNING_SHOWN
+    if LOG_FILE is not None:
+        try:
+            LOG_FILE.close()
+        except Exception:
+            pass
+        LOG_FILE = None
+    if not LOG_WARNING_SHOWN:
+        LOG_WARNING_SHOWN = True
+        builtins.print(
+            timestamp_text(f"[警告] 日志不可用：{exc}；继续仅输出控制台。"),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def write_log(message: str) -> None:
+    if LOG_FILE is None or "\r" in message or not message.strip():
+        return
+    try:
+        LOG_FILE.write(message.strip("\n") + "\n")
+        LOG_FILE.flush()
+    except (OSError, UnicodeError) as exc:
+        warn_log_failure(exc)
+
+
+def initialize_log() -> Path | None:
+    global LOG_FILE
+    try:
+        log_dir = Path(__file__).resolve().parent / "logs"
+        log_path = log_dir / (
+            f"codex_runtime_repair_py_{datetime.now():%Y%m%d-%H%M%S}_"
+            f"{os.getpid()}_{uuid.uuid4().hex[:8]}.log"
+        )
+        log_dir.mkdir(exist_ok=True)
+        LOG_FILE = log_path.open("x", encoding="utf-8")
+    except OSError as exc:
+        warn_log_failure(exc)
+        return None
+    return log_path
+
+
 def print(
     *values: object,
     sep: str = " ",
@@ -94,17 +140,25 @@ def print(
 ) -> None:
     destination = file if file is not None else sys.stdout
     message = sep.join(str(value) for value in values)
-    builtins.print(timestamp_text(message), end=end, file=destination, flush=flush)
+    formatted = timestamp_text(message)
+    builtins.print(formatted, end=end, file=destination, flush=flush)
+    write_log(formatted)
 
 
 def input(prompt: str = "") -> str:
-    return builtins.input(timestamp_text(prompt))
+    formatted = timestamp_text(prompt)
+    write_log(formatted)
+    return builtins.input(formatted)
 
 
 class TimestampArgumentParser(argparse.ArgumentParser):
     def _print_message(self, message: str | None, file=None) -> None:
         if message:
-            (file or sys.stderr).write(timestamp_text(message))
+            destination = file or sys.stderr
+            formatted = timestamp_text(message)
+            destination.write(formatted)
+            if destination is sys.stderr:
+                write_log(formatted)
 
 
 def format_elapsed(seconds: float) -> str:
@@ -132,7 +186,7 @@ class PackageInfo:
 class RuntimeManifest:
     node_relative_path: str
     repl_relative_path: str
-    node_version: str
+    node_binary_version: str
 
 
 @dataclass(frozen=True)
@@ -348,6 +402,9 @@ def load_runtime_manifest(source_root: Path) -> RuntimeManifest:
     node_version = data.get("node_version")
     if not isinstance(node_version, str) or not node_version.strip():
         raise RepairError(EXIT_DISCOVERY, "cua_node manifest 缺少有效字段：node_version")
+    node_binary_version = data.get("node_binary_version", node_version)
+    if not isinstance(node_binary_version, str) or not node_binary_version.strip():
+        raise RepairError(EXIT_DISCOVERY, "cua_node manifest 缺少有效字段：node_binary_version")
 
     missing = [
         path_from_relative(source_root, relative)
@@ -359,7 +416,7 @@ def load_runtime_manifest(source_root: Path) -> RuntimeManifest:
             EXIT_DISCOVERY,
             "官方 cua_node 源目录缺少关键文件：" + ", ".join(str(path) for path in missing),
         )
-    return RuntimeManifest(node_path, repl_path, node_version.strip())
+    return RuntimeManifest(node_path, repl_path, node_binary_version.strip())
 
 
 def scan_tree(root: Path) -> TreeSnapshot:
@@ -487,7 +544,7 @@ def test_node(runtime_root: Path, manifest: RuntimeManifest) -> ValidationResult
         return ValidationResult(False, (f"Node 测试无法执行：{exc}",))
 
     actual = completed.stdout.strip() or completed.stderr.strip()
-    expected = manifest.node_version.lstrip("vV")
+    expected = manifest.node_binary_version.lstrip("vV")
     normalized_actual = actual.lstrip("vV")
     errors: list[str] = []
     if completed.returncode != 0:
@@ -625,6 +682,11 @@ class CopyProgress:
     def finish(self) -> None:
         with self.lock:
             self._render("完成", force=True)
+            write_log(timestamp_text(
+                f"[复制] 完成：文件 {self.completed_files}/{self.total_files}，"
+                f"{format_bytes(self.copied_bytes)}/{format_bytes(self.total_bytes)}，"
+                f"耗时 {format_elapsed(time.monotonic() - self.started)}"
+            ))
 
     def _render(self, relative: str, force: bool = False) -> None:
         now = time.monotonic()
@@ -1834,6 +1896,9 @@ def ask_for_confirmation(args: argparse.Namespace, package: PackageInfo, runtime
 
 def main() -> int:
     configure_console()
+    log_path = initialize_log()
+    if log_path is not None:
+        print(f"[日志] 文件：{log_path}")
     args = parse_arguments()
     if os.name != "nt":
         raise RepairError(EXIT_DISCOVERY, "此脚本仅支持 Windows。")
@@ -1953,7 +2018,7 @@ def main() -> int:
                 + format_validation_errors(repair_node_test)
                 + f"。正式 runtime 未修改，repair 保留在：{repair_root}",
             )
-        print(f"[校验] repair 验证通过，Node v{manifest.node_version.lstrip('vV')} 可运行。")
+        print(f"[校验] repair 验证通过，Node v{manifest.node_binary_version.lstrip('vV')} 可运行。")
 
         backup_root = activate_runtime(
             repair_root,
@@ -1995,6 +2060,8 @@ if __name__ == "__main__":
     try:
         try:
             exit_code = main()
+        except SystemExit as exc:
+            exit_code = exc.code if isinstance(exc.code, int) else EXIT_UNEXPECTED
         except KeyboardInterrupt:
             print("\n[中断] 用户中断操作。", file=sys.stderr)
             exit_code = EXIT_INTERRUPTED
@@ -2005,5 +2072,11 @@ if __name__ == "__main__":
             print(f"[失败] 未预期错误（{type(exc).__name__}）：{exc}", file=sys.stderr)
             exit_code = EXIT_UNEXPECTED
     finally:
+        print(f"[结束] 退出码：{exit_code}")
         print(f"[耗时] 本次运行总耗时：{format_elapsed(time.monotonic() - SCRIPT_STARTED_AT)}")
+        if LOG_FILE is not None:
+            try:
+                LOG_FILE.close()
+            except Exception as exc:
+                warn_log_failure(exc)
     sys.exit(exit_code)
